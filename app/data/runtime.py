@@ -65,6 +65,7 @@ from app.policies.defaults import default_asset_policy_engine
 from app.policies.engine import AssetPolicyEngine
 from app.scanner.active import (
     ActiveMarketScanner,
+    ActiveScannerBucket,
     ActiveScannerCandidate,
     ActiveScannerResult,
     IntradayFreshnessStatus,
@@ -2080,6 +2081,103 @@ def build_active_scanner_observation_temporal_alignment_report(
             )
             if not passed
         ),
+    }
+
+
+def build_readonly_active_scan_cycle_report(
+    config: ApplicationConfig,
+    *,
+    cache: HistoricalDataCache | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Run one deterministic, read-only active scan cycle from cached 1H bars."""
+    effective_cache = cache or HistoricalDataCache(DEFAULT_MARKET_DATA_CACHE_PATH)
+    now = (clock or (lambda: datetime.now(UTC)))()
+    instruments = _active_scanner_cached_instruments(effective_cache)
+    scan_cycle_timestamp = (
+        _active_scanner_as_of(effective_cache, instruments, TimeFrame.ONE_HOUR) or now
+    )
+    bars_by_symbol = {
+        instrument.symbol: effective_cache.get_bars(
+            provider="alpaca",
+            instrument_key=(instrument.broker, instrument.broker_instrument_id),
+            timeframe=TimeFrame.ONE_HOUR,
+            as_of=scan_cycle_timestamp,
+            limit=ACTIVE_SCANNER_1H_LOOKBACK_BARS,
+            instrument_factory=instrument.model_dump(mode="json"),
+        )
+        for instrument in instruments
+    }
+    portfolio = PortfolioSnapshot(
+        as_of=scan_cycle_timestamp,
+        currency=Currency.EUR,
+        cash=Decimal("200"),
+    )
+    scanner = ActiveMarketScanner(minimum_bars=ACTIVE_SCANNER_1H_MINIMUM_BARS)
+    result = scanner.scan(
+        instruments=instruments,
+        bars_by_symbol=bars_by_symbol,
+        portfolio=portfolio,
+        as_of=scan_cycle_timestamp,
+        timeframe=TimeFrame.ONE_HOUR,
+        simulated_capital=Decimal("200"),
+    )
+    snapshot = scanner.build_observation_snapshot(
+        instruments=instruments,
+        bars_by_symbol=bars_by_symbol,
+        portfolio=portfolio,
+        scan_cycle_timestamp=scan_cycle_timestamp,
+        timeframe=TimeFrame.ONE_HOUR,
+        simulated_capital=Decimal("200"),
+    )
+    observations = tuple(snapshot.entry_candidates) + tuple(snapshot.entry_exclusions)
+    observation_by_symbol = {item.symbol: item for item in observations}
+    asset_records = tuple(
+        {
+            **_scanner_observation_payload(observation_by_symbol[candidate.symbol]),
+            "ranking_position": candidate.rank,
+            "classification": candidate.bucket.value,
+            "reason_code": candidate.rejection_reasons
+            or (
+                (candidate.bucket.value,)
+                if candidate.bucket is not ActiveScannerBucket.TOP_OPPORTUNITIES
+                else ()
+            ),
+        }
+        for candidate in result.candidates
+        if candidate.symbol in observation_by_symbol
+    )
+    blockers = () if instruments and observations else ("NO_VALIDATED_1H_OBSERVATIONS",)
+    return {
+        "status": "READ_ONLY_ACTIVE_SCAN_CYCLE_READY" if not blockers else "BLOCKED",
+        "phase": "STEP_9_0A4_READ_ONLY_ACTIVE_SCAN_CYCLE",
+        "scan_cycle_timestamp": scan_cycle_timestamp.isoformat(),
+        "universe_scanned": tuple(instrument.symbol for instrument in instruments),
+        "assets_requested": len(instruments),
+        "assets_comparable": len(snapshot.entry_candidates),
+        "assets_excluded": len(snapshot.entry_exclusions),
+        "top_opportunities": tuple(
+            _active_candidate_payload(item) for item in result.top_opportunities
+        ),
+        "watchlist": tuple(_active_candidate_payload(item) for item in result.watchlist),
+        "no_trade": tuple(_active_candidate_payload(item) for item in result.no_trade),
+        "rejected": tuple(_active_candidate_payload(item) for item in result.rejected),
+        "asset_observations": asset_records,
+        "positions_to_manage": tuple(
+            _scanner_observation_payload(item) for item in snapshot.positions_to_manage
+        ),
+        "temporal_metadata": {
+            "all_observations_causal": all(
+                item.bar_timestamp <= item.scan_cycle_timestamp for item in observations
+            ),
+            "duplicate_evaluations_prevented": snapshot.duplicate_evaluations_prevented,
+            "observation_keys": tuple(item.duplicate_evaluation_key for item in observations),
+        },
+        "scanner_output": _active_scanner_payload(result),
+        "broker_write_calls": 0,
+        "demo_execution_enabled": config.etoro_demo_execution_enabled,
+        "real_execution_available": False,
+        "critical_blockers": blockers,
     }
 
 

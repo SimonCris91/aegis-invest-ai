@@ -36,6 +36,7 @@ from app.data.runtime import (
     build_live_intelligence_report,
     build_polygon_provider_pilot_report,
     build_prospective_shadow_validation_readiness_report,
+    build_readonly_active_scan_cycle_report,
     build_real_strategy_validation_report,
     build_runtime_forensics_report,
 )
@@ -92,6 +93,7 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
             "runtime-forensics",
             "active-market-scanner",
             "active-scanner-observation-alignment",
+            "active-scan-cycle",
             "active-scanner-1h-foundation",
             "active-scanner-1h-full-universe-sweep",
             "active-scanner-1h-pilot",
@@ -332,6 +334,18 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
             encoding="utf-8",
         )
         payload["report_path"] = str(report_path)
+    elif args.command == "active-scan-cycle":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_readonly_active_scan_cycle_report(config),
+        }
+        report_path = Path("reports") / "step9_0a4_readonly_active_scan_cycle.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            _render_readonly_active_scan_cycle_report(payload),
+            encoding="utf-8",
+        )
+        payload["report_path"] = str(report_path)
     elif args.command == "active-scanner-1h-foundation":
         payload = {
             "application": APPLICATION_NAME,
@@ -558,6 +572,62 @@ def _render_active_scanner_observation_alignment_report(
     lines.append(json.dumps(payload.get("critical_blockers"), sort_keys=True, default=str))
     lines.append("```")
     lines.append("")
+    return "\n".join(lines)
+
+
+def _render_readonly_active_scan_cycle_report(payload: Mapping[str, object]) -> str:
+    lines = [
+        "# STEP 9.0A4 Read-Only Active Scan Cycle",
+        "",
+        f"- status: `{payload.get('status', 'UNKNOWN')}`",
+        f"- scan_cycle_timestamp: `{payload.get('scan_cycle_timestamp', 'UNKNOWN')}`",
+        f"- assets_requested: `{payload.get('assets_requested', 0)}`",
+        f"- assets_comparable: `{payload.get('assets_comparable', 0)}`",
+        f"- assets_excluded: `{payload.get('assets_excluded', 0)}`",
+        f"- broker_write_calls: `{payload.get('broker_write_calls', 0)}`",
+        f"- demo_execution_enabled: `{payload.get('demo_execution_enabled', False)}`",
+        f"- real_execution_available: `{payload.get('real_execution_available', False)}`",
+        "",
+        "## Asset Observations",
+        "",
+        "```json",
+        json.dumps(payload.get("asset_observations", ()), sort_keys=True, default=str),
+        "```",
+        "",
+        "## Ranking",
+        "",
+        "```json",
+        json.dumps(
+            {
+                "top_opportunities": payload.get("top_opportunities", ()),
+                "watchlist": payload.get("watchlist", ()),
+                "no_trade": payload.get("no_trade", ()),
+                "rejected": payload.get("rejected", ()),
+            },
+            sort_keys=True,
+            default=str,
+        ),
+        "```",
+        "",
+        "## Position Management Set",
+        "",
+        "```json",
+        json.dumps(payload.get("positions_to_manage", ()), sort_keys=True, default=str),
+        "```",
+        "",
+        "## Temporal Metadata",
+        "",
+        "```json",
+        json.dumps(payload.get("temporal_metadata", {}), sort_keys=True, default=str),
+        "```",
+        "",
+        "## Critical Blockers",
+        "",
+        "```json",
+        json.dumps(payload.get("critical_blockers", ()), sort_keys=True, default=str),
+        "```",
+        "",
+    ]
     return "\n".join(lines)
 
 

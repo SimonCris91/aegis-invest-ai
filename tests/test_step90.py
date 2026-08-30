@@ -19,6 +19,7 @@ from app.data.runtime import (
     build_active_scanner_1h_iex_equity_pilot_report,
     build_active_scanner_1h_pilot_report,
     build_active_scanner_observation_temporal_alignment_report,
+    build_readonly_active_scan_cycle_report,
 )
 from app.domain.enums import AssetClass, Currency, MarketStatus, SettlementType
 from app.domain.portfolio import PortfolioSnapshot, Position
@@ -161,6 +162,96 @@ def test_active_scanner_prevents_duplicate_symbol_timestamp_decisions() -> None:
     assert result.broker_write_calls == 0
 
 
+def test_active_scanner_reuse_isolated_across_sequential_cycles() -> None:
+    cycle_one = datetime(2026, 8, 28, 16, 0, tzinfo=UTC)
+    cycle_two = datetime(2026, 8, 29, 16, 0, tzinfo=UTC)
+    old_instrument = _instrument("OLD", AssetClass.EQUITY, "201", cycle_one)
+    next_instrument = _instrument("NEXT", AssetClass.ETF, "202", cycle_two)
+    duplicate_next = _instrument("NEXT", AssetClass.ETF, "202", cycle_two)
+    old_portfolio = PortfolioSnapshot(
+        as_of=cycle_one,
+        currency=Currency.EUR,
+        cash=Decimal("150"),
+        positions=(
+            Position(
+                position_id="old-position",
+                instrument_id=201,
+                symbol="OLD",
+                settlement_type=SettlementType.REAL,
+                units=Decimal("1"),
+                average_entry_price=Decimal("100"),
+                market_price=Decimal("100"),
+            ),
+        ),
+    )
+    next_portfolio = _portfolio(cycle_two)
+    old_bars = _bars(old_instrument, as_of=cycle_one, drift=Decimal("-0.001"))
+    next_bars = _bars(next_instrument, as_of=cycle_two, drift=Decimal("0.01"))
+
+    reused = ActiveMarketScanner(minimum_bars=60)
+    first_result = reused.scan(
+        instruments=(old_instrument,),
+        bars_by_symbol={"OLD": old_bars},
+        portfolio=old_portfolio,
+        as_of=cycle_one,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+    reused_first_snapshot = reused.build_observation_snapshot(
+        instruments=(old_instrument,),
+        bars_by_symbol={"OLD": old_bars},
+        portfolio=old_portfolio,
+        scan_cycle_timestamp=cycle_one,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+    second_result = reused.scan(
+        instruments=(next_instrument, duplicate_next),
+        bars_by_symbol={"NEXT": next_bars},
+        portfolio=next_portfolio,
+        as_of=cycle_two,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+    reused_second_snapshot = reused.build_observation_snapshot(
+        instruments=(next_instrument, duplicate_next),
+        bars_by_symbol={"NEXT": next_bars},
+        portfolio=next_portfolio,
+        scan_cycle_timestamp=cycle_two,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+
+    fresh = ActiveMarketScanner(minimum_bars=60)
+    fresh_result = fresh.scan(
+        instruments=(next_instrument, duplicate_next),
+        bars_by_symbol={"NEXT": next_bars},
+        portfolio=next_portfolio,
+        as_of=cycle_two,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+    fresh_snapshot = fresh.build_observation_snapshot(
+        instruments=(next_instrument, duplicate_next),
+        bars_by_symbol={"NEXT": next_bars},
+        portfolio=next_portfolio,
+        scan_cycle_timestamp=cycle_two,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+
+    assert first_result.as_of == cycle_one
+    assert reused_first_snapshot.scan_cycle_timestamp == cycle_one
+    assert second_result == fresh_result
+    assert reused_second_snapshot == fresh_snapshot
+    assert second_result.duplicate_decisions_prevented == 1
+    assert fresh_result.duplicate_decisions_prevented == 1
+    assert tuple(item.symbol for item in second_result.candidates) == ("NEXT",)
+    assert reused_second_snapshot.positions_to_manage == ()
+    assert all(
+        item.scan_cycle_timestamp == cycle_two for item in reused_second_snapshot.entry_candidates
+    )
+    assert all(
+        item.existing_position_state == "NO_POSITION"
+        for item in reused_second_snapshot.entry_candidates
+    )
+    assert second_result.broker_write_calls == 0
+
+
 def test_active_scanner_calculates_eur200_capital_without_short_or_broker_write() -> None:
     as_of = datetime(2026, 8, 28, tzinfo=UTC)
     instrument = _instrument("AAA", AssetClass.EQUITY, "101", as_of)
@@ -273,9 +364,22 @@ def test_one_hour_market_closed_is_not_classified_as_data_failure() -> None:
         timeframe=TimeFrame.ONE_HOUR,
         simulated_capital=Decimal("200"),
     )
+    snapshot = ActiveMarketScanner(minimum_bars=60).build_observation_snapshot(
+        instruments=(instrument,),
+        bars_by_symbol={"SPY": bars},
+        portfolio=_portfolio(as_of),
+        scan_cycle_timestamp=as_of,
+        timeframe=TimeFrame.ONE_HOUR,
+        simulated_capital=Decimal("200"),
+    )
 
     assert result.no_trade[0].freshness == "MARKET_CLOSED"
     assert result.no_trade[0].rejection_reasons == ("MARKET_CLOSED",)
+    assert result.no_trade[0].opportunity_score == Decimal("0")
+    assert result.no_trade[0].decision.value == "HOLD"
+    assert snapshot.entry_candidates[0].eligible_for_entry_comparison is True
+    assert snapshot.entry_candidates[0].opportunity_score == Decimal("0")
+    assert snapshot.entry_candidates[0].action_state == "HOLD"
     assert result.rejected == ()
     assert result.broker_write_calls == 0
 
@@ -710,6 +814,67 @@ def test_active_scanner_observation_alignment_report_materializes_temporal_align
     assert "STEP 9.0A3 Scanner Observation Temporal Alignment" in report_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_readonly_active_scan_cycle_is_deterministic_and_read_only(tmp_path: Path) -> None:
+    as_of = datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
+    cache = HistoricalDataCache(tmp_path / "work" / "market-data-cache.sqlite3")
+    _seed_alpaca_1h_full_universe_cache(cache, as_of=as_of)
+
+    first = build_readonly_active_scan_cycle_report(
+        load_config({}), cache=cache, clock=lambda: as_of
+    )
+    second = build_readonly_active_scan_cycle_report(
+        load_config({}), cache=cache, clock=lambda: as_of
+    )
+
+    assert first == second
+    assert first["status"] == "READ_ONLY_ACTIVE_SCAN_CYCLE_READY"
+    assert int(cast(int, first["assets_requested"])) == 34
+    assert (
+        int(cast(int, first["assets_comparable"])) + int(cast(int, first["assets_excluded"])) == 34
+    )
+    temporal_metadata = cast(dict[str, object], first["temporal_metadata"])
+    assert temporal_metadata["all_observations_causal"] is True
+    assert int(cast(int, first["broker_write_calls"])) == 0
+    assert first["demo_execution_enabled"] is False
+    assert first["real_execution_available"] is False
+
+
+def test_active_scan_cycle_keeps_held_symbol_in_management_set() -> None:
+    as_of = datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
+    held = _instrument("HELD", AssetClass.EQUITY, "101", as_of)
+    other = _instrument("OTHER", AssetClass.ETF, "102", as_of)
+    portfolio = PortfolioSnapshot(
+        as_of=as_of,
+        currency=Currency.EUR,
+        cash=Decimal("150"),
+        positions=(
+            Position(
+                position_id="held-1",
+                instrument_id=101,
+                symbol="HELD",
+                settlement_type=SettlementType.REAL,
+                units=Decimal("1"),
+                average_entry_price=Decimal("100"),
+                market_price=Decimal("100"),
+            ),
+        ),
+    )
+    scanner = ActiveMarketScanner(minimum_bars=60)
+    snapshot = scanner.build_observation_snapshot(
+        instruments=(held, other),
+        bars_by_symbol={
+            "HELD": _bars(held, as_of=as_of, count=60, timeframe=TimeFrame.ONE_HOUR),
+            "OTHER": _bars(other, as_of=as_of, count=60, timeframe=TimeFrame.ONE_HOUR),
+        },
+        portfolio=portfolio,
+        scan_cycle_timestamp=as_of,
+        timeframe=TimeFrame.ONE_HOUR,
+    )
+
+    assert tuple(item.symbol for item in snapshot.positions_to_manage) == ("HELD",)
+    assert snapshot.broker_write_calls == 0
 
 
 def test_one_hour_insufficient_warmup_rejects_fail_closed() -> None:
