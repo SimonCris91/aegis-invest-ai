@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from math import isfinite
 
 from pydantic import Field
 
@@ -116,7 +117,13 @@ def _map_demo_position(raw: object) -> DemoPortfolioPosition:
     )
 
 
-def map_instrument_resolution(raw: object, *, symbol: str, as_of: datetime) -> InstrumentResolution:
+def map_instrument_resolution(
+    raw: object,
+    *,
+    symbol: str,
+    as_of: datetime,
+    expected_instrument_id: int | None = None,
+) -> InstrumentResolution:
     if not isinstance(raw, dict):
         raise EtoroMappingError("instrument search payload must be an object")
     try:
@@ -124,14 +131,26 @@ def map_instrument_resolution(raw: object, *, symbol: str, as_of: datetime) -> I
         if not isinstance(items, list):
             raise TypeError
         item = next(
-            value for value in items if str(value["internalSymbolFull"]).strip() == symbol.strip()
+            value
+            for value in items
+            if (
+                expected_instrument_id is not None
+                and int(value["instrumentId"]) == expected_instrument_id
+            )
+            or (
+                expected_instrument_id is None
+                and str(value["internalSymbolFull"]).strip() == symbol.strip()
+            )
         )
         instrument_id = int(item["instrumentId"])
         hidden = _optional_bool(item, "isHiddenFromClient")
         delisted = _optional_bool(item, "isDelisted")
         active = _optional_bool(item, "isActiveInPlatform")
+        exchange_open = _optional_bool(item, "isExchangeOpen")
+        is_open = _optional_bool(item, "isOpen")
         tradable = _optional_bool(item, "isCurrentlyTradable")
         buy_enabled = _optional_bool(item, "isBuyEnabled")
+        is_internal = _optional_bool(item, "isInternalInstrument")
         structurally_supported, structural_status = _structural_support(
             delisted=delisted,
             hidden=hidden,
@@ -146,8 +165,11 @@ def map_instrument_resolution(raw: object, *, symbol: str, as_of: datetime) -> I
             classification_evidence_source="search",
             classification_status="RAW_METADATA_RETAINED",
             market_status=_market_status(item),
+            is_exchange_open=exchange_open,
+            is_open=is_open,
             is_currently_tradable=tradable,
             is_buy_enabled=buy_enabled,
+            is_internal_instrument=is_internal,
             is_hidden_from_client=hidden,
             is_delisted=delisted,
             is_active_in_platform=active,
@@ -443,10 +465,40 @@ def _optional_decimal(item: dict[str, object], key: str) -> Decimal | None:
 
 
 def _provider_datetime(value: object) -> datetime:
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if isinstance(value, bool):
+        raise ValueError("provider timestamp must not be boolean")
+    if isinstance(value, (int, float)):
+        return _epoch_datetime(float(value))
+    text = str(value).strip()
+    try:
+        if text and _is_numeric_timestamp(text):
+            return _epoch_datetime(float(text))
+        iso_value = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+        parsed = datetime.fromisoformat(iso_value)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("invalid provider timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _is_numeric_timestamp(value: str) -> bool:
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    return isfinite(number)
+
+
+def _epoch_datetime(value: float) -> datetime:
+    if not isfinite(value):
+        raise ValueError("provider timestamp must be finite")
+    # eToro payloads may encode Unix time in seconds or milliseconds.
+    seconds = value / 1000 if abs(value) >= 1_000_000_000_000 else value
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("provider timestamp is out of range") from exc
 
 
 def _market_status(item: dict[str, object]) -> MarketStatus:
@@ -547,14 +599,24 @@ def map_quote(raw: object, *, instrument_id: int, symbol: str, currency: Currenc
         raise EtoroMappingError("rate payload must be an object")
     try:
         rows = raw["rates"]
-        row = next(x for x in rows if int(x["instrumentID"]) == instrument_id)
+        matching_rows = [
+            row
+            for row in rows
+            if isinstance(row, dict) and int(row["instrumentID"]) == instrument_id
+        ]
+        if not matching_rows:
+            raise StopIteration
+        row, as_of = max(
+            ((_row, _provider_datetime(_row["date"])) for _row in matching_rows),
+            key=lambda item: item[1],
+        )
         return MarketQuote(
             instrument_id=instrument_id,
             symbol=symbol,
             price=Decimal(str(row["lastExecution"])),
             bid=Decimal(str(row["bid"])),
             ask=Decimal(str(row["ask"])),
-            as_of=_provider_datetime(row["date"]),
+            as_of=as_of,
             currency=currency,
             source="etoro-official-api",
             market_status=MarketStatus.UNKNOWN,

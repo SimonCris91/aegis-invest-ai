@@ -21,6 +21,7 @@ from app.agent.service import DeterministicAegisAgent
 from app.brokers.etoro.auth import EtoroCredentials
 from app.brokers.etoro.client import (
     BASE,
+    DEMO_AGGREGATE_PATH,
     DEMO_ELIGIBILITY_PATH,
     DEMO_INSTRUMENT_BREAKDOWN_PATH,
     EtoroApiError,
@@ -737,6 +738,29 @@ def test_etoro_read_client_fails_closed_on_bad_status_json_and_schema(now: datet
     )
     with pytest.raises(EtoroApiError):
         bad_lookup.demo_eligibility(TEST_INSTRUMENT_ID, "TEST")
+
+
+def test_etoro_read_client_uses_demo_position_when_filled_order_row_is_absent(
+    now: datetime,
+) -> None:
+    transport = SequencedTransport(
+        [
+            HttpResponse(
+                200,
+                {},
+                _bytes({"instruments": [{"instrumentId": TEST_INSTRUMENT_ID, "orders": []}]}),
+            ),
+            HttpResponse(200, {}, _bytes(_demo_payload(now))),
+        ]
+    )
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"), DisciplinedHttpClient(transport)
+    )
+
+    state = client.demo_order_state(_identity(), TEST_INSTRUMENT_ID, "order-1")
+
+    assert state is ExecutionState.FILLED
+    assert transport.calls[1][1] == BASE + DEMO_AGGREGATE_PATH
 
 
 def test_mapping_failures_and_demo_state_semantics(now: datetime) -> None:

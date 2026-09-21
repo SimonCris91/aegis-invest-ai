@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.domain.enums import (
     AIProviderMode,
+    BrokerExecutionMode,
     BrokerProviderMode,
     Environment,
     EtoroTransportMode,
@@ -92,6 +93,9 @@ class MarketScannerConfig(BaseModel):
     deep_analysis_limit: int = Field(default=5, ge=1, le=20)
     etoro_search_text: str | None = Field(default=None, min_length=1)
     etoro_max_pages: int = Field(default=1, ge=1, le=10)
+    active_cycle_minimum_coverage_ratio: Decimal | None = Field(default=None, gt=0, le=1)
+    live_acquisition_batch_size: int = Field(default=64, ge=1, le=1000)
+    live_acquisition_concurrency: int = Field(default=4, ge=1, le=16)
 
     @model_validator(mode="after")
     def limits_are_ordered(self) -> "MarketScannerConfig":
@@ -136,6 +140,7 @@ class ApplicationConfig(BaseModel):
     environment: Environment = Environment.DEMO
     operating_mode: OperatingMode = OperatingMode.OFFLINE_PAPER
     initial_capital_eur: Decimal = Field(default=Decimal("200"), gt=0)
+    authorized_capital_eur: Decimal | None = Field(default=None, gt=0)
     target_allocations: TargetAllocations = Field(default_factory=TargetAllocations)
     risk: RiskPolicyConfig = Field(default_factory=RiskPolicyConfig)
     strategy: AegisStrategyConfig = Field(default_factory=AegisStrategyConfig)
@@ -146,13 +151,25 @@ class ApplicationConfig(BaseModel):
     production_trading_enabled: bool = False
     etoro_api_enabled: bool = False
     etoro_demo_execution_enabled: bool = False
+    etoro_demo_automatic_pilot_enabled: bool = False
     demo_smoke_test_opt_in: bool = False
     etoro_transport_mode: EtoroTransportMode = EtoroTransportMode.SYSTEM_PROXY
     execution_policy: ExecutionPolicy = ExecutionPolicy.ADVISORY
+    broker_execution_mode: BrokerExecutionMode = BrokerExecutionMode.READ_ONLY
     log_level: str = "INFO"
 
     @model_validator(mode="after")
     def enforce_demo_only_build(self) -> "ApplicationConfig":
+        if self.broker_execution_mode is BrokerExecutionMode.REAL_EXECUTION:
+            raise ValueError("REAL_EXECUTION is unavailable in this build")
+        if self.broker_execution_mode is BrokerExecutionMode.DEMO_EXECUTION and (
+            self.operating_mode is not OperatingMode.ETORO_DEMO
+            or not self.etoro_api_enabled
+            or not self.etoro_demo_execution_enabled
+        ):
+            raise ValueError(
+                "DEMO_EXECUTION requires ETORO_DEMO mode and explicitly enabled Demo API"
+            )
         if self.environment is Environment.PRODUCTION:
             raise ValueError("PRODUCTION is disabled in this build")
         if self.production_trading_enabled:
@@ -163,6 +180,14 @@ class ApplicationConfig(BaseModel):
             raise ValueError("Demo execution requires ETORO_DEMO mode and enabled API")
         if self.demo_smoke_test_opt_in and not self.etoro_demo_execution_enabled:
             raise ValueError("Demo smoke-test opt-in requires Demo execution to be enabled")
+        if self.etoro_demo_automatic_pilot_enabled and (
+            self.operating_mode is not OperatingMode.ETORO_DEMO or not self.etoro_api_enabled
+        ):
+            raise ValueError("automatic Demo pilot requires ETORO_DEMO mode and enabled API")
+        if self.etoro_demo_automatic_pilot_enabled and not self.etoro_demo_execution_enabled:
+            raise ValueError(
+                "automatic Demo pilot requires Demo execution to be explicitly enabled"
+            )
         if self.execution_policy is ExecutionPolicy.AUTONOMOUS and (
             self.operating_mode is not OperatingMode.ETORO_DEMO
             or not self.etoro_demo_execution_enabled

@@ -1,6 +1,7 @@
 """Environment-backed configuration loading with safe local .env support."""
 
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from os import environ
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from app.config.models import (
 )
 from app.domain.enums import (
     AIProviderMode,
+    BrokerExecutionMode,
     BrokerProviderMode,
     Environment,
     EtoroTransportMode,
@@ -52,6 +54,28 @@ def _parse_positive_int(name: str, value: str, *, default: int) -> int:
     if parsed <= 0:
         raise ConfigLoadError(f"{name} must be a positive integer")
     return parsed
+
+
+def _parse_optional_positive_decimal(name: str, value: str | None) -> Decimal | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = Decimal(value.strip())
+    except InvalidOperation as exc:
+        raise ConfigLoadError(f"{name} must be a positive decimal") from exc
+    if parsed <= 0:
+        raise ConfigLoadError(f"{name} must be a positive decimal")
+    return parsed
+
+
+def _parse_broker_execution_mode(value: str | None) -> BrokerExecutionMode:
+    raw = "" if value is None else value.strip().upper()
+    if not raw:
+        return BrokerExecutionMode.READ_ONLY
+    try:
+        return BrokerExecutionMode(raw)
+    except ValueError:
+        return BrokerExecutionMode.READ_ONLY
 
 
 def load_runtime_values(
@@ -107,6 +131,10 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
         demo_enabled = _parse_bool(
             "ETORO_DEMO_EXECUTION_ENABLED", source.get("ETORO_DEMO_EXECUTION_ENABLED", "false")
         )
+        automatic_demo_pilot_enabled = _parse_bool(
+            "AEGIS_ETORO_DEMO_AUTOMATIC_PILOT_ENABLED",
+            source.get("AEGIS_ETORO_DEMO_AUTOMATIC_PILOT_ENABLED", "false"),
+        )
         smoke_opt_in = _parse_bool(
             "ETORO_DEMO_SMOKE_TEST_OPT_IN",
             source.get("ETORO_DEMO_SMOKE_TEST_OPT_IN", "false"),
@@ -115,6 +143,12 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
             source.get("AEGIS_ETORO_TRANSPORT_MODE", "SYSTEM_PROXY").upper()
         )
         execution_policy = ExecutionPolicy(source.get("AEGIS_EXECUTION_POLICY", "ADVISORY").upper())
+        broker_execution_mode = _parse_broker_execution_mode(
+            source.get("AEGIS_BROKER_EXECUTION_MODE")
+        )
+        authorized_capital_eur = _parse_optional_positive_decimal(
+            "AEGIS_AUTHORIZED_CAPITAL_EUR", source.get("AEGIS_AUTHORIZED_CAPITAL_EUR")
+        )
         confidence_profile = source.get("AEGIS_CONFIDENCE_PROFILE", "V1_LEGACY").strip().upper()
         exit_policy_profile = (
             source.get("AEGIS_EXIT_POLICY_PROFILE", "EXITPOLICY_V1_LEGACY").strip().upper()
@@ -122,11 +156,14 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
         return ApplicationConfig(
             environment=environment,
             operating_mode=operating_mode,
+            authorized_capital_eur=authorized_capital_eur,
             etoro_api_enabled=api_enabled,
             etoro_demo_execution_enabled=demo_enabled,
+            etoro_demo_automatic_pilot_enabled=automatic_demo_pilot_enabled,
             demo_smoke_test_opt_in=smoke_opt_in,
             etoro_transport_mode=etoro_transport_mode,
             execution_policy=execution_policy,
+            broker_execution_mode=broker_execution_mode,
             kill_switch=_parse_bool("AEGIS_KILL_SWITCH", raw_kill_switch),
             log_level=log_level,
             providers=ProviderConfig(
@@ -161,6 +198,20 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
                     "AEGIS_ETORO_SCAN_MAX_PAGES",
                     source.get("AEGIS_ETORO_SCAN_MAX_PAGES", "1"),
                     default=1,
+                ),
+                active_cycle_minimum_coverage_ratio=_parse_optional_positive_decimal(
+                    "AEGIS_ACTIVE_CYCLE_MINIMUM_COVERAGE_RATIO",
+                    source.get("AEGIS_ACTIVE_CYCLE_MINIMUM_COVERAGE_RATIO"),
+                ),
+                live_acquisition_batch_size=_parse_positive_int(
+                    "AEGIS_LIVE_ACQUISITION_BATCH_SIZE",
+                    source.get("AEGIS_LIVE_ACQUISITION_BATCH_SIZE", "64"),
+                    default=64,
+                ),
+                live_acquisition_concurrency=_parse_positive_int(
+                    "AEGIS_LIVE_ACQUISITION_CONCURRENCY",
+                    source.get("AEGIS_LIVE_ACQUISITION_CONCURRENCY", "4"),
+                    default=4,
                 ),
             ),
             paper_trading=PaperTradingConfig(

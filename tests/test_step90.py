@@ -1,6 +1,7 @@
 """Step 9.0 active market scanner foundation tests."""
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from app.config import load_config
+from app.config.models import ApplicationConfig
 from app.data.historical.alpaca import AlpacaHistoricalMarketDataProvider
 from app.data.historical.cache import HistoricalDataCache
 from app.data.models import ProviderInstrumentReference
@@ -384,6 +386,30 @@ def test_one_hour_market_closed_is_not_classified_as_data_failure() -> None:
     assert result.broker_write_calls == 0
 
 
+def test_authoritative_open_state_overrides_utc_closed_fallback() -> None:
+    as_of = datetime(2026, 9, 4, 6, 44, tzinfo=UTC)
+    instrument = _instrument(
+        "OPEN-EARLY", AssetClass.EQUITY, "1001", as_of, market_status=MarketStatus.OPEN
+    )
+    instrument = instrument.model_copy(update={"tags": ("session-state:OPEN_TRADABLE",)})
+    bars = _bars(
+        instrument,
+        as_of=as_of - timedelta(hours=1),
+        count=60,
+        timeframe=TimeFrame.ONE_HOUR,
+    )
+
+    freshness = classify_intraday_freshness(
+        instrument=instrument,
+        timeframe=TimeFrame.ONE_HOUR,
+        bars=bars,
+        as_of=as_of,
+        minimum_bars=60,
+    )
+
+    assert freshness is not IntradayFreshnessStatus.MARKET_CLOSED
+
+
 def test_one_hour_weekend_closure_remains_market_closed_not_stale() -> None:
     as_of = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     instrument = _instrument("AAPL", AssetClass.EQUITY, "1001", as_of)
@@ -499,7 +525,24 @@ def test_active_scanner_1h_pilot_cli_writes_report_file(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     cache = HistoricalDataCache(tmp_path / "work" / "market-data-cache.sqlite3")
-    _seed_alpaca_1h_pilot_cache(cache, as_of=datetime(2026, 8, 30, 16, 0, tzinfo=UTC))
+    as_of = datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
+    _seed_alpaca_1h_pilot_cache(cache, as_of=as_of)
+
+    def deterministic_builder(
+        config: ApplicationConfig,
+        *,
+        values: Mapping[str, str] | None = None,
+    ) -> dict[str, object]:
+        return build_active_scanner_1h_pilot_report(
+            config,
+            values=values,
+            clock=lambda: as_of,
+        )
+
+    monkeypatch.setattr(
+        "app.main.__main__.build_active_scanner_1h_pilot_report",
+        deterministic_builder,
+    )
 
     assert (
         main(

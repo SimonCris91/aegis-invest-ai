@@ -1,5 +1,6 @@
 """Deterministic Step 5 broker, storage, performance, and safety tests."""
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -8,6 +9,7 @@ from uuid import UUID
 import pytest
 
 from app.brokers.etoro.auth import EtoroCredentials
+from app.brokers.etoro.client import EtoroReadClient
 from app.brokers.etoro.demo import (
     DEMO_ORDER_URL,
     DemoExecutionError,
@@ -42,6 +44,22 @@ from app.performance.metrics import (
 from app.risk.kill_switch import KillSwitch
 from app.risk.manager import RiskManager
 from app.storage.sqlite import SecretPersistenceError, SqliteRecordStore
+
+
+class HeaderRecordingTransport:
+    def __init__(self, response: HttpResponse) -> None:
+        self.response = response
+        self.last_headers: dict[str, str] = {}
+        self.last_url = ""
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None = None
+    ) -> HttpResponse:
+        self.last_headers = headers
+        self.last_url = url
+        assert method == "GET"
+        assert body is None
+        return self.response
 
 
 class StubTransport:
@@ -129,10 +147,133 @@ def test_official_mappings_are_strict(now: datetime) -> None:
         map_identity({"username": "incomplete"})
 
 
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        (datetime(2026, 8, 31, 10, tzinfo=UTC).timestamp(), datetime(2026, 8, 31, 10, tzinfo=UTC)),
+        (
+            int(datetime(2026, 8, 31, 10, tzinfo=UTC).timestamp() * 1000),
+            datetime(2026, 8, 31, 10, tzinfo=UTC),
+        ),
+    ],
+)
+def test_quote_mapper_normalizes_epoch_seconds_and_milliseconds(
+    timestamp: float | int, expected: datetime
+) -> None:
+    quote = map_quote(
+        {
+            "rates": [
+                {"instrumentID": 7, "lastExecution": 10, "bid": 9, "ask": 11, "date": timestamp}
+            ]
+        },
+        instrument_id=7,
+        symbol="TEST",
+        currency=Currency.USD,
+    )
+    assert quote.as_of == expected
+
+
+def test_quote_mapper_selects_latest_matching_rate_entry() -> None:
+    quote = map_quote(
+        {
+            "rates": [
+                {
+                    "instrumentID": 7,
+                    "lastExecution": 10,
+                    "bid": 9,
+                    "ask": 11,
+                    "date": "2026-08-31T09:00:00Z",
+                },
+                {
+                    "instrumentID": 7,
+                    "lastExecution": 12,
+                    "bid": 11,
+                    "ask": 13,
+                    "date": "2026-08-31T10:00:00Z",
+                },
+            ]
+        },
+        instrument_id=7,
+        symbol="TEST",
+        currency=Currency.USD,
+    )
+    assert quote.as_of == datetime(2026, 8, 31, 10, tzinfo=UTC)
+    assert quote.price == 12
+
+
+def test_quote_read_requests_uncached_rates() -> None:
+    now = datetime(2026, 8, 31, 10, tzinfo=UTC)
+    transport = HeaderRecordingTransport(
+        HttpResponse(
+            200,
+            {},
+            json.dumps(
+                {
+                    "rates": [
+                        {
+                            "instrumentID": 7,
+                            "lastExecution": 10,
+                            "bid": 9,
+                            "ask": 11,
+                            "date": now.isoformat(),
+                        }
+                    ]
+                }
+            ).encode(),
+        )
+    )
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api-secret", user_key="user-secret"),
+        DisciplinedHttpClient(transport, max_read_attempts=1),
+    )
+
+    client.quote(7, "TEST")
+
+    assert "instrumentIds=7" in transport.last_url
+    assert "_aegis_quote_refresh=" in transport.last_url
+    assert transport.last_headers["Cache-Control"] == "no-cache"
+    assert transport.last_headers["Pragma"] == "no-cache"
+
+
+def test_quote_with_diagnostics_returns_raw_dates_without_secrets() -> None:
+    now = datetime(2026, 8, 31, 10, tzinfo=UTC)
+    transport = HeaderRecordingTransport(
+        HttpResponse(
+            200,
+            {},
+            json.dumps(
+                {
+                    "rates": [
+                        {
+                            "instrumentID": 7,
+                            "lastExecution": 10,
+                            "bid": 9,
+                            "ask": 11,
+                            "date": now.isoformat(),
+                        }
+                    ]
+                }
+            ).encode(),
+        )
+    )
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api-secret", user_key="user-secret"),
+        DisciplinedHttpClient(transport, max_read_attempts=1),
+    )
+
+    quote, dates, server_now = client.quote_with_diagnostics(7, "TEST")
+
+    assert dates == (now.isoformat(),)
+    assert quote.as_of == now
+    assert server_now is None
+
+
 def test_demo_route_guard_has_no_fallback() -> None:
     assert_demo_route(DEMO_ORDER_URL)
+    assert DEMO_ORDER_URL == "https://public-api.etoro.com/api/v2/trading/execution/demo/orders"
     for url in (
-        "http://public-api.etoro.com/api/v3/trading/execution/demo/orders",
+        "http://public-api.etoro.com/api/v2/trading/execution/demo/orders",
+        "https://public-api.etoro.com/api/v3/trading/execution/demo/orders",
         "https://public-api.etoro.com/api/v3/trading/execution/real/orders",
         "https://evil.invalid/api/v3/trading/execution/demo/orders",
     ):

@@ -289,7 +289,7 @@ class HistoricalDataCache:
         rows = self._connection.execute(
             "SELECT provider, broker, broker_instrument_id, symbol, timeframe, timestamp, "
             "open, high, low, close, volume, currency, source, data_quality, fetched_at, "
-            "mapping_payload FROM historical_bars"
+            "CAST(mapping_payload AS BLOB) FROM historical_bars"
         ).fetchall()
         quarantined: list[dict[str, object]] = []
         for row in rows:
@@ -297,7 +297,36 @@ class HistoricalDataCache:
             expected = expected_asset_classes.get(symbol)
             if expected is None:
                 continue
-            payload = json.loads(str(row[15]))
+            try:
+                payload_text = bytes(row[15]).decode("utf-8")
+                payload = json.loads(payload_text)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                reason = "CORRUPT_MAPPING_PAYLOAD_UTF8"
+                safe_payload = f"CORRUPT_UTF8_HEX:{bytes(row[15]).hex()}"
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO historical_bars_quarantine("
+                    "provider, broker, broker_instrument_id, symbol, timeframe, timestamp, "
+                    "open, high, low, close, volume, currency, source, data_quality, fetched_at, "
+                    "mapping_payload, quarantine_reason, original_asset_class, quarantined_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*tuple(row[:15]), safe_payload, reason, None, quarantined_at.isoformat()),
+                )
+                self._connection.execute(
+                    "DELETE FROM historical_bars WHERE provider=? AND broker=? "
+                    "AND broker_instrument_id=? AND timeframe=? AND timestamp=?",
+                    (row[0], row[1], row[2], row[4], row[5]),
+                )
+                quarantined.append(
+                    {
+                        "symbol": symbol,
+                        "provider": row[0],
+                        "broker_instrument_id": row[2],
+                        "timeframe": row[4],
+                        "timestamp": row[5],
+                        "reason": reason,
+                    }
+                )
+                continue
             observed_raw = payload.get("asset_class")
             observed = str(observed_raw).upper() if observed_raw is not None else "UNKNOWN"
             if observed == expected.value:

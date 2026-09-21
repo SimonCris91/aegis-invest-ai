@@ -27,6 +27,7 @@ class EtoroRuntimeSettings(FrozenDomainModel):
     readiness_symbol: str | None = Field(default=None, min_length=1)
     readiness_instrument_id: int | None = Field(default=None, gt=0)
     maximum_quote_age_seconds: int = Field(default=300, gt=0)
+    maximum_future_quote_skew_seconds: int = Field(default=5, ge=0, le=30)
     expected_username: str | None = Field(default=None, min_length=1, repr=False, exclude=True)
     expected_gcid: str | None = Field(default=None, min_length=1, repr=False, exclude=True)
 
@@ -60,6 +61,12 @@ def runtime_settings(values: Mapping[str, str] | None = None) -> EtoroRuntimeSet
     )
     if maximum_quote_age_seconds is None:
         maximum_quote_age_seconds = 300
+    maximum_future_quote_skew_seconds = _optional_int(
+        "AEGIS_ETORO_MAX_FUTURE_QUOTE_SKEW_SECONDS",
+        source.get("AEGIS_ETORO_MAX_FUTURE_QUOTE_SKEW_SECONDS", "5"),
+    )
+    if maximum_future_quote_skew_seconds is None:
+        maximum_future_quote_skew_seconds = 5
     expected_username = source.get("ETORO_EXPECTED_USERNAME", "").strip() or None
     expected_gcid = source.get("ETORO_EXPECTED_GCID", "").strip() or None
     return EtoroRuntimeSettings(
@@ -73,6 +80,7 @@ def runtime_settings(values: Mapping[str, str] | None = None) -> EtoroRuntimeSet
             source.get("AEGIS_ETORO_READINESS_INSTRUMENT_ID", ""),
         ),
         maximum_quote_age_seconds=maximum_quote_age_seconds,
+        maximum_future_quote_skew_seconds=maximum_future_quote_skew_seconds,
         expected_username=expected_username,
         expected_gcid=expected_gcid,
     )

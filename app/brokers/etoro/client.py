@@ -1,6 +1,8 @@
 """Authenticated eToro reads using only documented official routes."""
 
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from time import time_ns
 from typing import NoReturn
 from urllib.parse import urlencode
 
@@ -62,6 +64,7 @@ UNIVERSAL_SEARCH_FIELDS = ",".join(
         "isExchangeOpen",
         "isCurrentlyTradable",
         "isBuyEnabled",
+        "isInternalInstrument",
         "isHiddenFromClient",
         "isDelisted",
         "isActiveInPlatform",
@@ -122,18 +125,26 @@ class EtoroReadClient:
     def __init__(self, credentials: EtoroCredentials, http: DisciplinedHttpClient) -> None:
         self._credentials = credentials
         self._http = http
+        self._last_server_now: datetime | None = None
 
-    def _get_response(self, path: str) -> HttpResponse:
+    @property
+    def last_server_now(self) -> datetime | None:
+        return self._last_server_now
+
+    def _get_response(
+        self, path: str, *, extra_headers: dict[str, str] | None = None
+    ) -> HttpResponse:
         try:
-            response = self._http.get(BASE + path, self._credentials.headers())
+            headers = {**self._credentials.headers(), **(extra_headers or {})}
+            response = self._http.get(BASE + path, headers)
         except TransportError as exc:
             self._raise_transport_error(path, "eToro read", exc)
         if response.status != 200:
             self._raise_response_error(response, path, "eToro read")
         return response
 
-    def _get(self, path: str) -> object:
-        response = self._get_response(path)
+    def _get(self, path: str, *, extra_headers: dict[str, str] | None = None) -> object:
+        response = self._get_response(path, extra_headers=extra_headers)
         return self._response_json(response, path)
 
     def _response_json(self, response: HttpResponse, path: str) -> object:
@@ -172,6 +183,9 @@ class EtoroReadClient:
             symbols=symbols,
         )
 
+    def demo_portfolio_payload(self) -> object:
+        return self._get(DEMO_PORTFOLIO_PATH)
+
     def real_portfolio_read_only(
         self, symbols: dict[int, str], *, currency: Currency = Currency.USD
     ) -> PortfolioSnapshot:
@@ -185,12 +199,38 @@ class EtoroReadClient:
     def quote(
         self, instrument_id: int, symbol: str, *, currency: Currency = Currency.USD
     ) -> MarketQuote:
-        query = urlencode({"instrumentIds": str(instrument_id)})
-        return map_quote(
-            self._get(f"{RATES_PATH}?{query}"),
-            instrument_id=instrument_id,
-            symbol=symbol,
-            currency=currency,
+        quote, _, _ = self.quote_with_diagnostics(instrument_id, symbol, currency=currency)
+        return quote
+
+    def quote_with_diagnostics(
+        self, instrument_id: int, symbol: str, *, currency: Currency = Currency.USD
+    ) -> tuple[MarketQuote, tuple[object, ...], datetime | None]:
+        # Prevent an intermediary from replaying a stale cached rates response.
+        query = urlencode(
+            {"instrumentIds": str(instrument_id), "_aegis_quote_refresh": str(time_ns())}
+        )
+        response = self._get_response(
+            f"{RATES_PATH}?{query}",
+            extra_headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        )
+        raw = self._response_json(response, RATES_PATH)
+        self._last_server_now = _http_server_datetime(response.headers)
+        if not isinstance(raw, dict) or not isinstance(raw.get("rates"), list):
+            raise EtoroApiError("invalid rate payload", endpoint=RATES_PATH)
+        dates = tuple(
+            row.get("date")
+            for row in raw["rates"]
+            if isinstance(row, dict) and str(row.get("instrumentID")) == str(instrument_id)
+        )
+        return (
+            map_quote(
+                raw,
+                instrument_id=instrument_id,
+                symbol=symbol,
+                currency=currency,
+            ),
+            dates,
+            self._last_server_now,
         )
 
     def resolve_instrument(
@@ -210,6 +250,59 @@ class EtoroReadClient:
             as_of=as_of or datetime.now(UTC),
         )
 
+    def resolve_instrument_id(
+        self, instrument_id: int, *, symbol: str, as_of: datetime | None = None
+    ) -> InstrumentResolution:
+        """Resolve session metadata by the authoritative broker instrument ID."""
+        if instrument_id <= 0:
+            raise ValueError("instrument_id must be positive")
+        query = urlencode(
+            {
+                "fields": UNIVERSAL_SEARCH_FIELDS,
+                "instrumentId": str(instrument_id),
+                "pageSize": "10",
+                "pageNumber": "1",
+            }
+        )
+        return map_instrument_resolution(
+            self._get(f"{SEARCH_PATH}?{query}"),
+            symbol=symbol,
+            as_of=as_of or datetime.now(UTC),
+            expected_instrument_id=instrument_id,
+        )
+
+    def resolve_session_instrument_id(
+        self, instrument_id: int, *, symbol: str, as_of: datetime | None = None
+    ) -> InstrumentResolution:
+        """Recover delisted session evidence without weakening execution lookup."""
+        try:
+            return self.resolve_instrument_id(instrument_id, symbol=symbol, as_of=as_of)
+        except EtoroMappingError as exc:
+            if str(exc) != "instrument symbol was not resolved exactly":
+                raise
+        query = urlencode({
+            "fields": UNIVERSAL_SEARCH_FIELDS,
+            "instrumentId": str(instrument_id),
+            "isDelisted": "true",
+            "pageSize": "10",
+            "pageNumber": "1",
+        })
+        # One physical request. Never retry a diagnostic fallback on throttling.
+        path = f"{SEARCH_PATH}?{query}"
+        try:
+            response = self._http.get_once(BASE + path, self._credentials.headers())
+        except TransportError as exc:
+            self._raise_transport_error(path, "eToro delisted session lookup", exc)
+        if response.status != 200:
+            self._raise_response_error(response, path, "eToro delisted session lookup")
+        resolution = map_instrument_resolution(
+            self._response_json(response, path), symbol=symbol,
+            as_of=as_of or datetime.now(UTC), expected_instrument_id=instrument_id,
+        )
+        if resolution.is_delisted is not True:
+            raise EtoroMappingError("delisted session lookup did not confirm delisting")
+        return resolution
+
     def raw_instrument_search(self, symbol: str) -> object:
         query = urlencode(
             {
@@ -227,6 +320,10 @@ class EtoroReadClient:
         query = urlencode({"instrumentIds": ",".join(str(item) for item in instrument_ids)})
         raw = self._get(f"{INSTRUMENTS_PATH}?{query}")
         return _extract_instrument_metadata(raw)
+
+    def instrument_display_data(self) -> object:
+        """Read the unfiltered official instrument display catalog."""
+        return self._get(INSTRUMENTS_PATH)
 
     def instrument_type_names(self) -> dict[int, str]:
         raw = self._get(INSTRUMENT_TYPES_PATH)
@@ -255,21 +352,67 @@ class EtoroReadClient:
             broker="etoro",
         )
 
+    def session_catalog_page(self, *, page_number: int, page_size: int = 100) -> object:
+        if page_number <= 0 or page_size <= 0:
+            raise ValueError("pagination must be positive")
+        query = urlencode(
+            {
+                "fields": UNIVERSAL_SEARCH_FIELDS,
+                "pageSize": page_size,
+                "pageNumber": page_number,
+            }
+        )
+        return self._get(f"{SEARCH_PATH}?{query}")
+
+    def session_catalog_ids(self, instrument_ids: tuple[int, ...]) -> object:
+        """Exact single-ID search; this endpoint has no instrumentIds bulk filter."""
+        if len(instrument_ids) != 1 or instrument_ids[0] <= 0:
+            raise ValueError("session lookup requires exactly one positive instrument ID")
+        query = urlencode(
+            {
+                "fields": UNIVERSAL_SEARCH_FIELDS,
+                "instrumentId": str(instrument_ids[0]),
+                "pageNumber": 1,
+                "pageSize": 100,
+            }
+        )
+        path = f"{SEARCH_PATH}?{query}"
+        try:
+            response = self._http.get_once(BASE + path, self._credentials.headers())
+        except TransportError as exc:
+            self._raise_transport_error(path, "eToro session lookup", exc)
+        if response.status != 200:
+            self._raise_response_error(response, path, "eToro session lookup")
+        return self._response_json(response, path)
+
     def demo_account(self, identity: BrokerIdentity) -> DemoPortfolioSnapshot:
         return map_demo_portfolio(self._get(DEMO_AGGREGATE_PATH), identity)
 
     def demo_eligibility(
         self, instrument_id: int, symbol: str, *, currency: Currency = Currency.USD
     ) -> DemoEligibility:
-        raw = self._post_read(
-            DEMO_ELIGIBILITY_PATH,
-            {
-                "instrumentIds": [instrument_id],
-                "symbols": [symbol],
-                "currency": currency.value,
-            },
-        )
+        response = self.demo_eligibility_response(instrument_id, symbol, currency=currency)
+        if response.status != 200:
+            self._raise_response_error(response, DEMO_ELIGIBILITY_PATH, "eToro eligibility lookup")
+        raw = self._response_json(response, DEMO_ELIGIBILITY_PATH)
         return map_demo_eligibility(raw, instrument_id, symbol)
+
+    def demo_eligibility_response(
+        self, instrument_id: int, symbol: str, *, currency: Currency = Currency.USD
+    ) -> HttpResponse:
+        """Informational POST shared with diagnostics; return HTTP errors unmapped."""
+        try:
+            return self._http.post_read(
+                BASE + DEMO_ELIGIBILITY_PATH,
+                self._credentials.headers(),
+                {
+                    "instrumentIds": [instrument_id],
+                    "symbols": [symbol],
+                    "currency": currency.value,
+                },
+            )
+        except TransportError as exc:
+            self._raise_transport_error(DEMO_ELIGIBILITY_PATH, "eToro eligibility lookup", exc)
 
     def candle_history(
         self,
@@ -306,9 +449,35 @@ class EtoroReadClient:
             self._raise_response_error(
                 response, DEMO_INSTRUMENT_BREAKDOWN_PATH, "eToro Demo status read"
             )
+        raw: object | None = None
         try:
-            return map_demo_order_state(response.json(), instrument_id, order_id)
+            raw = response.json()
+            return map_demo_order_state(raw, instrument_id, order_id)
         except (ValueError, UnicodeDecodeError, EtoroMappingError) as exc:
+            # eToro's instrument-breakdown endpoint exposes active orders, but
+            # can omit an order immediately after it has been filled.  In that
+            # case the aggregate Demo portfolio is the authoritative read-only
+            # evidence: a new position for the requested instrument means the
+            # market order reached the account even though its order row is no
+            # longer present.  Only use this fallback for a structurally valid
+            # breakdown containing the requested instrument; malformed payloads
+            # must remain fail-closed.
+            if isinstance(exc, EtoroMappingError) and _has_instrument_breakdown(
+                raw, instrument_id
+            ):
+                try:
+                    portfolio = self.demo_account(identity)
+                except (EtoroApiError, RuntimeError, ValueError):
+                    raise EtoroApiError(
+                        "eToro Demo status could not be normalized",
+                        endpoint=DEMO_INSTRUMENT_BREAKDOWN_PATH,
+                    ) from exc
+                if any(
+                    position.instrument_id == instrument_id
+                    and position.current_exposure > 0
+                    for position in portfolio.positions
+                ):
+                    return ExecutionState.FILLED
             raise EtoroApiError(
                 "eToro Demo status could not be normalized",
                 endpoint=DEMO_INSTRUMENT_BREAKDOWN_PATH,
@@ -337,6 +506,18 @@ class EtoroReadClient:
         ) from exc
 
 
+def _has_instrument_breakdown(raw: object, instrument_id: int) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    instruments = raw.get("instruments")
+    if not isinstance(instruments, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("instrumentId") == instrument_id
+        for item in instruments
+    )
+
+
 def _extract_instrument_metadata(raw: object) -> dict[int, dict[str, object]]:
     instruments: dict[int, dict[str, object]] = {}
     for item in _iter_payload_objects(raw):
@@ -344,6 +525,19 @@ def _extract_instrument_metadata(raw: object) -> dict[int, dict[str, object]]:
         if instrument_id is not None:
             instruments[instrument_id] = item
     return instruments
+
+
+def _http_server_datetime(headers: dict[str, str]) -> datetime | None:
+    raw_date = next((value for key, value in headers.items() if key.casefold() == "date"), None)
+    if raw_date is None:
+        return None
+    try:
+        parsed = parsedate_to_datetime(raw_date)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def _extract_instrument_type_names(raw: object) -> dict[int, str]:

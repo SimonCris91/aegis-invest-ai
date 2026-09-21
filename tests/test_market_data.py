@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from app.brokers.market_validation import MarketObservationError, validate_market_observation
 from app.domain.enums import Currency, MarketStatus
 from app.domain.market import InstrumentMetadata, MarketQuote
 from app.market_data.providers import (
@@ -128,3 +129,32 @@ def test_quote_freshness_is_deterministic(now: datetime, market_quote: MarketQuo
     assert market_quote.is_fresh(as_of=now + timedelta(seconds=301), max_age_seconds=300) is False
     with pytest.raises(ValueError, match="timezone"):
         market_quote.is_fresh(as_of=now.replace(tzinfo=None), max_age_seconds=300)
+
+
+def test_small_future_quote_skew_can_be_tolerated(
+    now: datetime, market_quote: MarketQuote, instrument: InstrumentMetadata
+) -> None:
+    future = market_quote.model_copy(update={"as_of": now + timedelta(seconds=3)})
+
+    validate_market_observation(
+        future,
+        instrument,
+        now=now,
+        maximum_age_seconds=300,
+        maximum_future_skew_seconds=5,
+    )
+
+
+def test_large_future_quote_skew_is_rejected_as_future(
+    now: datetime, market_quote: MarketQuote, instrument: InstrumentMetadata
+) -> None:
+    future = market_quote.model_copy(update={"as_of": now + timedelta(seconds=6)})
+
+    with pytest.raises(MarketObservationError, match="future"):
+        validate_market_observation(
+            future,
+            instrument,
+            now=now,
+            maximum_age_seconds=300,
+            maximum_future_skew_seconds=5,
+        )

@@ -91,6 +91,8 @@ class RiskManager:
         *,
         issue_authorization: bool = True,
         ignore_kill_switch: bool = False,
+        _additional_violations: tuple[RiskViolation, ...] = (),
+        minimum_confidence_override: Decimal | None = None,
     ) -> RiskEvaluation:
         if ignore_kill_switch and issue_authorization:
             raise ValueError(
@@ -103,6 +105,9 @@ class RiskManager:
             if code not in seen_codes:
                 seen_codes.add(code)
                 violations.append(RiskViolation(code=code, message=message))
+
+        for violation in _additional_violations:
+            reject(violation.code, violation.message)
 
         is_position_increase = proposal.intent in {TradeIntent.OPEN, TradeIntent.INCREASE}
         is_position_reduction = proposal.intent in {TradeIntent.REDUCE, TradeIntent.CLOSE}
@@ -280,11 +285,18 @@ class RiskManager:
         if proposal.idempotency_key in context.recent_idempotency_keys:
             reject(RiskViolationCode.DUPLICATE_ORDER, "the proposal idempotency key is duplicated")
 
-        confidence_threshold = self._confidence_threshold_for(
-            proposal=proposal,
-            legacy_minimum_confidence=minimum_confidence,
-            reject=reject,
-        )
+        if minimum_confidence_override is not None and not (
+            Decimal("0") <= minimum_confidence_override <= Decimal("1")
+        ):
+            raise ValueError("minimum confidence override must be between 0 and 1")
+        if minimum_confidence_override is None:
+            confidence_threshold = self._confidence_threshold_for(
+                proposal=proposal,
+                legacy_minimum_confidence=minimum_confidence,
+                reject=reject,
+            )
+        else:
+            confidence_threshold = minimum_confidence_override
         if confidence_threshold is not None and proposal.confidence < confidence_threshold:
             reject(
                 RiskViolationCode.CONFIDENCE_BELOW_MINIMUM,
@@ -370,6 +382,63 @@ class RiskManager:
             authorization=authorization,
             authorization_deferred=status is RiskDecisionStatus.APPROVED
             and not issue_authorization,
+            approved_notional_eur=proposal.amount
+            if status is RiskDecisionStatus.APPROVED
+            else None,
+            approved_proposal=proposal if status is RiskDecisionStatus.APPROVED else None,
+        )
+
+    def evaluate_with_authorized_capital(
+        self,
+        proposal: TradeProposal,
+        context: RiskContext,
+        *,
+        issue_authorization: bool = True,
+        minimum_confidence_override: Decimal | None = None,
+    ) -> RiskEvaluation:
+        """Size an entry inside the user envelope, then apply all normal risk checks."""
+        envelope = context.capital_envelope
+        if proposal.intent not in {TradeIntent.OPEN, TradeIntent.INCREASE}:
+            return self.evaluate(
+                proposal,
+                context,
+                issue_authorization=issue_authorization,
+                minimum_confidence_override=minimum_confidence_override,
+            )
+        if envelope is None or envelope.remaining_authorized_capital_eur is None:
+            return self.evaluate(
+                proposal,
+                context,
+                issue_authorization=issue_authorization,
+                minimum_confidence_override=minimum_confidence_override,
+                _additional_violations=(
+                    RiskViolation(
+                        code=RiskViolationCode.AUTHORIZED_CAPITAL_UNAVAILABLE,
+                        message="user-authorized Aegis capital or managed exposure is unavailable",
+                    ),
+                ),
+            )
+        remaining = min(envelope.remaining_authorized_capital_eur, context.portfolio.cash)
+        if remaining <= 0:
+            return self.evaluate(
+                proposal,
+                context,
+                issue_authorization=issue_authorization,
+                minimum_confidence_override=minimum_confidence_override,
+                _additional_violations=(
+                    RiskViolation(
+                        code=RiskViolationCode.AUTHORIZED_CAPITAL_EXCEEDED,
+                        message="no authorized Aegis capital remains after exposure and reserves",
+                    ),
+                ),
+            )
+        sized_amount = min(proposal.amount, remaining)
+        sized_proposal = proposal.model_copy(update={"amount": sized_amount})
+        return self.evaluate(
+            sized_proposal,
+            context,
+            issue_authorization=issue_authorization,
+            minimum_confidence_override=minimum_confidence_override,
         )
 
     def _confidence_threshold_for(

@@ -125,6 +125,10 @@ class DisciplinedHttpClient:
         self._max_read_attempts = max_read_attempts
         self._sleeper = sleeper
 
+    def get_once(self, url: str, headers: dict[str, str]) -> HttpResponse:
+        """One physical GET; caller owns pacing and retry policy."""
+        return self._transport.request("GET", url, self._request_headers(url, headers))
+
     def get(self, url: str, headers: dict[str, str]) -> HttpResponse:
         response: HttpResponse | None = None
         for attempt in range(self._max_read_attempts):

@@ -43,6 +43,7 @@ class NewsFreshnessStatus(StrEnum):
 
 class NewsProviderStatus(StrEnum):
     AVAILABLE = "AVAILABLE"
+    PARTIAL = "PARTIAL"
     RATE_LIMITED = "RATE_LIMITED"
     AUTH_FAILED = "AUTH_FAILED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
@@ -116,6 +117,7 @@ class RawNewsItem(FrozenDomainModel):
     geographic_scope: str = Field(default="GLOBAL", min_length=1)
     summary: str | None = Field(default=None, min_length=1)
     source_quality: NewsSourceQuality = NewsSourceQuality.UNKNOWN_LOW_CONFIDENCE
+    provider: str = Field(default="unknown", min_length=1)
 
     @field_validator("published_at")
     @classmethod
@@ -228,7 +230,13 @@ class GlobalNewsIntelligenceResult(FrozenDomainModel):
     global_risk_snapshot: GlobalRiskSnapshot
     audit_records: tuple[dict[str, object], ...]
     provider_read_calls: int = Field(default=0, ge=0)
+    raw_event_count: int = Field(default=0, ge=0)
     broker_write_calls: int = Field(default=0, ge=0, le=0)
+    provider_name: str = "unknown"
+    provider_status: NewsProviderStatus = NewsProviderStatus.PROVIDER_UNAVAILABLE
+    provider_error_code: str | None = None
+    provider_error_detail_safe: str | None = None
+    provider_diagnostics: dict[str, object] = Field(default_factory=dict)
 
     @field_validator("as_of")
     @classmethod
@@ -264,10 +272,27 @@ class GlobalNewsIntelligenceEngine:
     def __init__(self, provider: GlobalNewsProvider | None = None) -> None:
         self._provider = provider or NewsFeedProvider()
 
+    @property
+    def provider_name(self) -> str:
+        return self._provider.provider_name
+
     def analyze(
         self, *, instruments: tuple[UniversalInstrument, ...], as_of: datetime
     ) -> GlobalNewsIntelligenceResult:
-        raw_items = self._provider.fetch_global_news(as_of=as_of)
+        setter = getattr(self._provider, "set_tickers", None)
+        if callable(setter):
+            setter(tuple(instrument.symbol for instrument in instruments))
+        try:
+            raw_items = self._provider.fetch_global_news(as_of=as_of)
+        except NewsProviderError as exc:
+            return self._unavailable_result(instruments=instruments, as_of=as_of, error=exc)
+        except Exception as exc:
+            error = NewsProviderError(
+                "news provider read failed",
+                status=NewsProviderStatus.PROVIDER_UNAVAILABLE,
+                provider_error_message=type(exc).__name__,
+            )
+            return self._unavailable_result(instruments=instruments, as_of=as_of, error=error)
         events = tuple(
             self._normalize(item=item, instruments=instruments, first_seen_at=as_of)
             for item in raw_items
@@ -283,6 +308,13 @@ class GlobalNewsIntelligenceEngine:
             for instrument in instruments
         }
         snapshot = _global_risk_snapshot(clusters=clusters, as_of=as_of)
+        provider_status = getattr(self._provider, "last_status", None)
+        if not isinstance(provider_status, NewsProviderStatus):
+            provider_status = (
+                NewsProviderStatus.AVAILABLE
+                if raw_items
+                else NewsProviderStatus.PROVIDER_UNAVAILABLE
+            )
         return GlobalNewsIntelligenceResult(
             as_of=as_of,
             normalized_events=events,
@@ -291,7 +323,44 @@ class GlobalNewsIntelligenceEngine:
             global_risk_snapshot=snapshot,
             audit_records=tuple(_audit_record(event) for event in events),
             provider_read_calls=getattr(self._provider, "read_calls", 0),
+            raw_event_count=len(raw_items),
             broker_write_calls=0,
+            provider_name=self._provider.provider_name,
+            provider_status=provider_status,
+            provider_diagnostics=_provider_diagnostics(self._provider),
+        )
+
+    def _unavailable_result(
+        self,
+        *,
+        instruments: tuple[UniversalInstrument, ...],
+        as_of: datetime,
+        error: NewsProviderError,
+    ) -> GlobalNewsIntelligenceResult:
+        contexts = {
+            instrument.symbol: _asset_context(
+                instrument=instrument,
+                clusters=(),
+                as_of=as_of,
+                provider_configured=False,
+            )
+            for instrument in instruments
+        }
+        return GlobalNewsIntelligenceResult(
+            as_of=as_of,
+            normalized_events=(),
+            event_clusters=(),
+            asset_contexts=contexts,
+            global_risk_snapshot=_global_risk_snapshot(clusters=(), as_of=as_of),
+            audit_records=(),
+            provider_read_calls=getattr(self._provider, "read_calls", 0),
+            raw_event_count=0,
+            broker_write_calls=0,
+            provider_name=self._provider.provider_name,
+            provider_status=error.status,
+            provider_error_code=error.status.value,
+            provider_error_detail_safe=error.provider_error_message,
+            provider_diagnostics=_provider_diagnostics(self._provider),
         )
 
     def _normalize(
@@ -343,7 +412,7 @@ class GlobalNewsIntelligenceEngine:
             impact_horizon=_impact_horizon(category),
             confidence=confidence,
             explanation=_explanation(category, links),
-            provenance=(self._provider.provider_name, item.source_quality.value),
+            provenance=(self._provider.provider_name, item.provider, item.source_quality.value),
         )
 
 
@@ -498,7 +567,28 @@ def _classify_category(text: str) -> GlobalNewsEventCategory:
         ),
         (GlobalNewsEventCategory.REGULATION, ("regulation", "regulator")),
         (GlobalNewsEventCategory.LEGAL, ("lawsuit", "court", "legal")),
-        (GlobalNewsEventCategory.GEOPOLITICS, ("war", "sanction", "geopolitical")),
+        (
+            GlobalNewsEventCategory.GEOPOLITICS,
+            (
+                "war",
+                "sanction",
+                "geopolitical",
+                "conflict",
+                "ceasefire",
+                "military",
+                "invasion",
+                "missile",
+                "nato",
+                "ukraine",
+                "russia",
+                "taiwan",
+                "china",
+                "iran",
+                "israel",
+                "tariff",
+                "trade war",
+            ),
+        ),
         (GlobalNewsEventCategory.ENERGY, ("oil", "energy", "opec")),
         (GlobalNewsEventCategory.COMMODITIES, ("gold", "commodity", "commodities")),
         (GlobalNewsEventCategory.CYBER_SECURITY, ("cyber", "hack", "breach")),
@@ -608,6 +698,24 @@ def _link_assets(
                         asset_class=instrument.asset_class,
                         reason="crypto event linked to crypto asset class",
                         confidence=Decimal("0.70"),
+                    )
+                )
+    if category in {
+        GlobalNewsEventCategory.GEOPOLITICS,
+        GlobalNewsEventCategory.SUPPLY_CHAIN,
+        GlobalNewsEventCategory.NATURAL_DISASTER,
+    }:
+        for instrument in instruments:
+            if instrument.asset_class in {AssetClass.ETF, AssetClass.CRYPTO}:
+                links.append(
+                    NewsAssetLink(
+                        symbol=instrument.symbol,
+                        asset_class=instrument.asset_class,
+                        reason=(
+                            "global geopolitical/supply risk linked to diversified "
+                            "or digital exposure"
+                        ),
+                        confidence=Decimal("0.55"),
                     )
                 )
     return _dedupe_links(tuple(links))
@@ -795,6 +903,11 @@ def _audit_record(event: NormalizedGlobalNewsEvent) -> dict[str, object]:
         "source_quality": str(event.source_reliability_score),
         "broker_write_calls": 0,
     }
+
+
+def _provider_diagnostics(provider: object) -> dict[str, object]:
+    diagnostics = getattr(provider, "last_diagnostics", {})
+    return dict(diagnostics) if isinstance(diagnostics, dict) else {}
 
 
 def _stable_id(*parts: str) -> str:

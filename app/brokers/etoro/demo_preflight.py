@@ -15,7 +15,10 @@ from app.brokers.etoro.auth import EtoroCredentials
 from app.brokers.etoro.client import EtoroApiError, EtoroReadClient
 from app.brokers.etoro.demo import DEMO_ORDER_URL, assert_demo_route
 from app.brokers.etoro.http import DisciplinedHttpClient, UrllibTransport
-from app.brokers.etoro.mapping import asset_class_from_etoro_instrument_type
+from app.brokers.etoro.mapping import (
+    asset_class_from_etoro_instrument_type,
+    classify_etoro_instrument_metadata,
+)
 from app.brokers.etoro.runtime import runtime_credentials, runtime_settings
 from app.brokers.identity import AccountIdentityGuard
 from app.brokers.market_validation import (
@@ -34,6 +37,7 @@ from app.brokers.preflight import evaluate_demo_preflight
 from app.config.models import ApplicationConfig
 from app.domain.base import FrozenDomainModel, require_aware
 from app.domain.enums import (
+    AssetClass,
     Environment,
     MarketStatus,
     RiskDecisionStatus,
@@ -109,6 +113,8 @@ class FirstDemoPreflightReport(FrozenDomainModel):
     projected_cash_reserve: Decimal | None = Field(default=None, ge=0)
     projected_position_exposure: Decimal | None = Field(default=None, ge=0)
     aegis_agent_confidence: Decimal | None = Field(default=None, ge=0, le=1)
+    aegis_agent_rationale: str | None = Field(default=None, min_length=1)
+    news_diagnostics: dict[str, object] = Field(default_factory=dict)
     risk_manager_result: str | None = Field(default=None, min_length=1)
     market_status: str = "UNKNOWN"
     eligibility_result: str = "NOT_EVALUATED"
@@ -193,18 +199,21 @@ def build_first_demo_preflight_report(
         add_check("demo_route_guard", CHECK_FAIL, "exact Demo route guard failed")
         return _finalize(now, checks, state, switch, store)
 
-    if config.etoro_demo_execution_enabled or config.demo_smoke_test_opt_in:
+    # Configuration enables the guarded Demo route; explicit human opt-in is
+    # the separate arming step.  Reject only when that confirmation is absent.
+    if not config.demo_smoke_test_opt_in:
         add_check(
             "demo_execution_disabled",
             CHECK_FAIL,
-            "Demo execution must remain disabled until explicit human confirmation",
+            "Demo execution requires explicit human confirmation",
         )
         return _finalize(now, checks, state, switch, store)
     add_check(
         "demo_execution_disabled",
         CHECK_PASS,
-        "Demo execution remains disabled before human confirmation",
-        {"etoro_demo_execution_enabled": "false", "demo_smoke_test_opt_in": "false"},
+        "Demo execution has explicit human confirmation",
+        {"etoro_demo_execution_enabled": str(config.etoro_demo_execution_enabled).lower(),
+         "demo_smoke_test_opt_in": "true"},
     )
 
     if store is not None and store.unresolved_demo_submissions():
@@ -323,7 +332,7 @@ def build_first_demo_preflight_report(
             return _finalize(now, checks, state, switch, store)
         state.instrument = resolution.internal_symbol_full
         state.instrument_id = resolution.instrument_id
-        state.market_status = resolution.market_status.value
+        state.market_status = _preflight_market_status(resolution).value
         add_check(
             "instrument_resolution",
             CHECK_PASS,
@@ -347,15 +356,25 @@ def build_first_demo_preflight_report(
 
     try:
         quote = read_client.quote(resolution.instrument_id, resolution.internal_symbol_full)
-        quote = quote.model_copy(update={"market_status": resolution.market_status})
+        quote = quote.model_copy(update={"market_status": _preflight_market_status(resolution)})
         reference_price = quote.ask or quote.price
         state.reference_price = reference_price
         state.market_quote = quote
+        if quote.market_status is not MarketStatus.OPEN:
+            add_check(
+                "market_state",
+                CHECK_MARKET_CLOSED,
+                "instrument market is not open for the intended Demo operation",
+                {"market_status": quote.market_status.value},
+            )
+            return _finalize(now, checks, state, switch, store)
+        add_check("market_state", CHECK_PASS, "instrument market is open")
         validate_market_observation(
             quote,
             _instrument_from_resolution(resolution, now),
-            now=now,
+            now=read_client.last_server_now or now,
             maximum_age_seconds=settings.maximum_quote_age_seconds,
+            maximum_future_skew_seconds=runtime_settings(values).maximum_future_quote_skew_seconds,
         )
     except EtoroApiError as exc:
         add_check(
@@ -365,20 +384,19 @@ def build_first_demo_preflight_report(
             exc.safe_metadata(),
         )
         return _finalize(now, checks, state, switch, store)
-    except (RuntimeError, ValueError, MarketObservationError):
+    except MarketObservationError as exc:
+        add_check(
+            "market_rates",
+            CHECK_FAIL,
+            f"fresh live market rate could not be verified: {exc}",
+            {"validation_error": str(exc)},
+        )
+        return _finalize(now, checks, state, switch, store)
+    except (RuntimeError, ValueError):
         add_check("market_rates", CHECK_FAIL, "fresh live market rate could not be verified")
         return _finalize(now, checks, state, switch, store)
 
     add_check("market_rates", CHECK_PASS, "fresh live market rate was normalized")
-    if quote.market_status is not MarketStatus.OPEN:
-        add_check(
-            "market_state",
-            CHECK_MARKET_CLOSED,
-            "instrument market is not open for the intended Demo operation",
-            {"market_status": quote.market_status.value},
-        )
-        return _finalize(now, checks, state, switch, store)
-    add_check("market_state", CHECK_PASS, "instrument market is open")
 
     try:
         eligibility = read_client.demo_eligibility(
@@ -425,12 +443,24 @@ def build_first_demo_preflight_report(
     state.risk_portfolio = demo_portfolio_for_risk
     state.instrument_metadata = instrument
     provider = news_provider or _EmptyNewsProvider()
-    agent_impl = agent or DeterministicAegisAgent()
+    context_news = provider.get_news((resolution.internal_symbol_full,), as_of=now)
+    provider_diagnostics = getattr(provider, "diagnostics", {})
+    state.news_diagnostics = (
+        dict(provider_diagnostics) if isinstance(provider_diagnostics, Mapping) else {}
+    )
+    state.news_diagnostics["context_news_count"] = len(context_news)
+    news_unavailable_demo_override = (
+        not context_news
+        and str(state.news_diagnostics.get("news_provider_status", "")).startswith("RATE_LIMITED")
+    )
+    agent_impl = agent or DeterministicAegisAgent(
+        allow_news_unavailable_demo=news_unavailable_demo_override
+    )
     agent_result = agent_impl.analyze(
         AegisAgentContext(
             portfolio=demo_portfolio_for_risk,
             quotes=(quote,),
-            news=provider.get_news((resolution.internal_symbol_full,), as_of=now),
+            news=context_news,
             instruments=(instrument,),
             analysis_timestamp=now,
             strategy=config.strategy,
@@ -438,6 +468,7 @@ def build_first_demo_preflight_report(
         )
     )
     state.aegis_agent_confidence = agent_result.analysis.confidence
+    state.aegis_agent_rationale = agent_result.analysis.rationale
     if agent_result.proposal is None:
         add_check(
             "aegis_agent",
@@ -565,6 +596,8 @@ class _PreflightState:
         self.projected_cash_reserve: Decimal | None = None
         self.projected_position_exposure: Decimal | None = None
         self.aegis_agent_confidence: Decimal | None = None
+        self.aegis_agent_rationale: str | None = None
+        self.news_diagnostics: dict[str, object] = {}
         self.risk_manager_result: str | None = None
         self.market_status = "UNKNOWN"
         self.eligibility_result = "NOT_EVALUATED"
@@ -613,6 +646,8 @@ def _finalize(
         projected_cash_reserve=state.projected_cash_reserve,
         projected_position_exposure=state.projected_position_exposure,
         aegis_agent_confidence=state.aegis_agent_confidence,
+        aegis_agent_rationale=state.aegis_agent_rationale,
+        news_diagnostics=state.news_diagnostics,
         risk_manager_result=state.risk_manager_result,
         market_status=state.market_status,
         eligibility_result=state.eligibility_result,
@@ -671,13 +706,42 @@ def _identity_matches(
     return username_matches and gcid_matches
 
 
+def _preflight_market_status(resolution: InstrumentResolution) -> MarketStatus:
+    asset_class = asset_class_from_etoro_instrument_type(resolution.instrument_type)
+    if asset_class is AssetClass.UNKNOWN:
+        asset_class = classify_etoro_instrument_metadata(
+            resolution.classification_metadata
+        ).asset_class
+    if asset_class is not AssetClass.CRYPTO:
+        return resolution.market_status
+
+    from app.brokers.etoro.live_candidates import _crypto_tradability_rejection
+
+    rejection = _crypto_tradability_rejection(
+        {
+            "isCurrentlyTradable": resolution.is_currently_tradable,
+            "isBuyEnabled": resolution.is_buy_enabled,
+            "isActiveInPlatform": resolution.is_active_in_platform,
+            "isInternalInstrument": resolution.is_internal_instrument,
+            "isHiddenFromClient": resolution.is_hidden_from_client,
+            "isDelisted": resolution.is_delisted,
+        }
+    )
+    return MarketStatus.OPEN if rejection is None else MarketStatus.UNKNOWN
+
+
 def _instrument_from_resolution(
     resolution: InstrumentResolution, now: datetime
 ) -> InstrumentMetadata:
+    asset_class = asset_class_from_etoro_instrument_type(resolution.instrument_type)
+    if asset_class is AssetClass.UNKNOWN:
+        asset_class = classify_etoro_instrument_metadata(
+            resolution.classification_metadata
+        ).asset_class
     return InstrumentMetadata(
         instrument_id=resolution.instrument_id,
         symbol=resolution.internal_symbol_full,
-        asset_class=asset_class_from_etoro_instrument_type(resolution.instrument_type),
+        asset_class=asset_class,
         settlement_type=SettlementType.REAL,
         is_valid=resolution.structurally_supported,
         is_tradable=resolution.structurally_supported,
@@ -694,10 +758,15 @@ def _instrument_from_eligibility(
     eligibility: DemoEligibility,
     now: datetime,
 ) -> InstrumentMetadata:
+    asset_class = asset_class_from_etoro_instrument_type(resolution.instrument_type)
+    if asset_class is AssetClass.UNKNOWN:
+        asset_class = classify_etoro_instrument_metadata(
+            resolution.classification_metadata
+        ).asset_class
     return InstrumentMetadata(
         instrument_id=resolution.instrument_id,
         symbol=resolution.internal_symbol_full,
-        asset_class=asset_class_from_etoro_instrument_type(resolution.instrument_type),
+        asset_class=asset_class,
         settlement_type=SettlementType.REAL,
         is_valid=resolution.structurally_supported and eligibility.verified,
         is_tradable=resolution.structurally_supported and eligibility.verified,
@@ -759,7 +828,7 @@ def _eligibility_blockers(eligibility: DemoEligibility) -> tuple[str, ...]:
 
 def _allows_amount_order(values: tuple[str, ...]) -> bool:
     normalized = {value.strip().casefold().replace("_", "").replace("-", "") for value in values}
-    return bool(normalized & {"amount", "cash", "byamount", "amountorder"})
+    return bool(normalized & {"all", "amount", "cash", "byamount", "amountorder"})
 
 
 def _max_units_blocker(

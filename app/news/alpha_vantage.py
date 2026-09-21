@@ -60,6 +60,10 @@ class AlphaVantageNewsProvider:
     def last_diagnostics(self) -> dict[str, object]:
         return dict(self._last_diagnostics)
 
+    def set_tickers(self, tickers: tuple[str, ...]) -> None:
+        """Select the ticker scope for the next read on a shared run provider."""
+        self._tickers = tickers
+
     def fetch_global_news(self, *, as_of: datetime) -> tuple[RawNewsItem, ...]:
         if self._api_key is None:
             raise NewsProviderError(
@@ -84,9 +88,12 @@ class AlphaVantageNewsProvider:
                 status=status,
                 http_status=exc.http_status,
                 sanitized_endpoint=exc.sanitized_endpoint or self._sanitized_url(),
-                provider_error_message=exc.provider_error_message
-                or exc.provider_error_code
-                or exc.transport_category,
+                provider_error_message=self._sanitize_provider_message(
+                    exc.provider_error_message
+                    or exc.provider_error_code
+                    or exc.transport_category
+                    or "provider error"
+                ),
             ) from exc
         except Exception as exc:
             raise NewsProviderError(
@@ -124,12 +131,13 @@ class AlphaVantageNewsProvider:
             raise self._malformed("response root is not an object")
         message = _provider_message(payload)
         if message is not None:
-            status = _status_from_provider_message(message)
+            safe_message = self._sanitize_provider_message(message)
+            status = _status_from_provider_message(safe_message)
             raise NewsProviderError(
                 "Alpha Vantage news provider returned a failure status",
                 status=status,
                 sanitized_endpoint=self._sanitized_url(),
-                provider_error_message=message,
+                provider_error_message=safe_message,
             )
         feed = payload.get("feed")
         if not isinstance(feed, list):
@@ -150,6 +158,12 @@ class AlphaVantageNewsProvider:
             sanitized_endpoint=self._sanitized_url(),
             provider_error_message=message,
         )
+
+    def _sanitize_provider_message(self, message: str) -> str:
+        """Prevent provider-echoed credentials from reaching diagnostics."""
+        if self._api_key is None:
+            return message
+        return message.replace(self._api_key, "<redacted>")
 
 
 def alpha_vantage_request_plan(
@@ -253,6 +267,7 @@ def _parse_article(raw: dict[str, object]) -> RawNewsItem:
             raw, topics=topics, ticker_sentiment=ticker_sentiment
         ),
         source_quality=_source_quality(source),
+        provider=ALPHA_VANTAGE_PROVIDER,
     )
 
 
@@ -333,10 +348,10 @@ def _provider_message(payload: dict[str, object]) -> str | None:
 
 def _status_from_provider_message(message: str) -> NewsProviderStatus:
     lowered = message.casefold()
-    if "api key" in lowered or "invalid" in lowered:
-        return NewsProviderStatus.AUTH_FAILED
     if "rate" in lowered or "frequency" in lowered or "standard api call frequency" in lowered:
         return NewsProviderStatus.RATE_LIMITED
+    if "api key" in lowered or "invalid" in lowered:
+        return NewsProviderStatus.AUTH_FAILED
     if "delayed" in lowered:
         return NewsProviderStatus.DELAYED
     return NewsProviderStatus.PROVIDER_UNAVAILABLE

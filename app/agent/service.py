@@ -37,14 +37,22 @@ class AgentAnalysisError(RuntimeError):
 class DeterministicAegisAgent:
     """Offline baseline that prefers HOLD and never consumes external text as instructions."""
 
-    def __init__(self, exit_policy: ExitPolicy | ExitPolicyV2Guarded | None = None) -> None:
+    def __init__(
+        self,
+        exit_policy: ExitPolicy | ExitPolicyV2Guarded | None = None,
+        *,
+        allow_news_unavailable_demo: bool = False,
+    ) -> None:
         self._exit_policy = exit_policy or ExitPolicy()
+        self._allow_news_unavailable_demo = allow_news_unavailable_demo
 
     def analyze(self, context: AegisAgentContext) -> AegisAgentResult:
         if context.intelligence_reports:
             return self._analyze_intelligence(context)
 
-        if not context.quotes or not context.instruments or not context.news:
+        if not context.quotes or not context.instruments or (
+            not context.news and not self._allow_news_unavailable_demo
+        ):
             return self._hold(context, "insufficient normalized evidence")
 
         quote = self._selected_quote(context)
@@ -69,7 +77,10 @@ class DeterministicAegisAgent:
         supporting = tuple(
             item for item in fresh_news if item.sentiment >= context.strategy.minimum_news_sentiment
         )
-        if len(supporting) < context.strategy.minimum_supporting_news:
+        if (
+            not self._allow_news_unavailable_demo
+            and len(supporting) < context.strategy.minimum_supporting_news
+        ):
             return self._hold(context, "evidence does not meet the conservative threshold")
 
         current_weight = context.portfolio.weight_for(instrument.instrument_id)
@@ -103,7 +114,11 @@ class DeterministicAegisAgent:
                 "loss of capital remains possible; execution requires independent approval"
             ),
             confidence=context.strategy.baseline_confidence,
-            supporting_factors=tuple(item.headline for item in supporting),
+            supporting_factors=(
+                tuple(item.headline for item in supporting)
+                if supporting
+                else ("explicit Demo override: news provider unavailable",)
+            ),
             risk_factors=("market risk", "model risk"),
             recommended_action=action,
             rationale="deterministic conservative thresholds were satisfied",

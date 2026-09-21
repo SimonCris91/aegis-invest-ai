@@ -12,6 +12,7 @@ class ProviderMode(StrEnum):
     NONE = "none"
     FAKE = "fake"
     FIXTURE = "fixture"
+    ALPHA_VANTAGE = "alpha_vantage"
 
 
 class AIProviderMode(StrEnum):
@@ -36,6 +37,12 @@ class ExecutionPolicy(StrEnum):
     ADVISORY = "ADVISORY"
     CONFIRM = "CONFIRM"
     AUTONOMOUS = "AUTONOMOUS"
+
+
+class BrokerExecutionMode(StrEnum):
+    READ_ONLY = "READ_ONLY"
+    DEMO_EXECUTION = "DEMO_EXECUTION"
+    REAL_EXECUTION = "REAL_EXECUTION"
 
 
 class EtoroTransportMode(StrEnum):
@@ -146,6 +153,8 @@ class RiskViolationCode(StrEnum):
     INVALID_CONFIDENCE_SEMANTICS = "INVALID_CONFIDENCE_SEMANTICS"
     CURRENCY_MISMATCH = "CURRENCY_MISMATCH"
     INVALID_TRADE_DIRECTION = "INVALID_TRADE_DIRECTION"
+    AUTHORIZED_CAPITAL_UNAVAILABLE = "AUTHORIZED_CAPITAL_UNAVAILABLE"
+    AUTHORIZED_CAPITAL_EXCEEDED = "AUTHORIZED_CAPITAL_EXCEEDED"
 
 
 class AuditEventType(StrEnum):

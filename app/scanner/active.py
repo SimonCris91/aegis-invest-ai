@@ -25,7 +25,14 @@ from app.domain.universe import (
     UniversalInstrument,
 )
 from app.domain.versions import RANKING_VERSION, SCANNER_VERSION
-from app.intelligence.models import AegisDecision, FeatureQuality, MarketBar, TimeFrame
+from app.intelligence.models import (
+    AegisDecision,
+    FeatureQuality,
+    MarketBar,
+    NewsSignal,
+    NewsSignalStatus,
+    TimeFrame,
+)
 from app.intelligence.service import AegisOpportunityIntelligenceEngine
 from app.policies.defaults import DEFAULT_POLICY_VERSION
 
@@ -281,8 +288,9 @@ class ActiveMarketScanner:
         timeframe: TimeFrame,
         simulated_capital: Decimal = Decimal("200"),
         news_context_by_symbol: Mapping[str, object] | None = None,
+        precomputed_result: ActiveScannerResult | None = None,
     ) -> ActiveScannerCrossAssetSnapshot:
-        scanner_result = self.scan(
+        scanner_result = precomputed_result or self.scan(
             instruments=instruments,
             bars_by_symbol=dict(bars_by_symbol),
             portfolio=portfolio,
@@ -456,6 +464,14 @@ class ActiveMarketScanner:
             bars_by_timeframe={timeframe: bars},
             as_of=latest.timestamp,
             required_timeframes=(timeframe,),
+            # The global news engine already produced the per-asset context;
+            # feed it into the decision model instead of attaching it only
+            # after the scanner has classified the candidate.
+            news_signal=_news_signal_from_context(
+                instrument=instrument,
+                context=news_context,
+                as_of=latest.timestamp,
+            ),
         )
         proposed = _proposed_allocation(portfolio=portfolio, instrument=instrument)
         bucket = _bucket_for(analysis.decision, analysis.opportunity_score.confidence)
@@ -488,6 +504,31 @@ class ActiveMarketScanner:
             else analysis.reasons,
             **_news_candidate_fields(news_context),
         )
+
+
+def attach_observational_news_context(
+    result: ActiveScannerResult,
+    news_context_by_symbol: Mapping[str, object],
+) -> ActiveScannerResult:
+    """Attach news metadata without recalculating market ranking or confidence."""
+
+    def enrich(
+        items: tuple[ActiveScannerCandidate, ...],
+    ) -> tuple[ActiveScannerCandidate, ...]:
+        return tuple(
+            item.model_copy(update=_news_candidate_fields(news_context_by_symbol.get(item.symbol)))
+            for item in items
+        )
+
+    return result.model_copy(
+        update={
+            "candidates": enrich(result.candidates),
+            "top_opportunities": enrich(result.top_opportunities),
+            "watchlist": enrich(result.watchlist),
+            "no_trade": enrich(result.no_trade),
+            "rejected": enrich(result.rejected),
+        }
+    )
 
 
 def scan_cached_active_market(
@@ -667,10 +708,15 @@ def classify_intraday_freshness(
         if age.total_seconds() <= 0:
             return IntradayFreshnessStatus.FRESH
         return IntradayFreshnessStatus.FRESH if age.days <= 2 else IntradayFreshnessStatus.STALE
-    if instrument.asset_class in {
-        AssetClass.EQUITY,
-        AssetClass.ETF,
-    } and not _is_market_closed_as_of(as_of):
+    market_closed = _market_closed_for_instrument(instrument=instrument, as_of=as_of)
+    if (
+        instrument.asset_class
+        in {
+            AssetClass.EQUITY,
+            AssetClass.ETF,
+        }
+        and not market_closed
+    ):
         expected_latest = _expected_completed_one_hour_bar_timestamp(as_of)
         if latest < expected_latest:
             return IntradayFreshnessStatus.STALE
@@ -681,9 +727,7 @@ def classify_intraday_freshness(
         if hours <= 6:
             return IntradayFreshnessStatus.DELAYED
         return IntradayFreshnessStatus.STALE
-    if instrument.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and _is_market_closed_as_of(
-        as_of
-    ):
+    if instrument.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and market_closed:
         return IntradayFreshnessStatus.MARKET_CLOSED
     hours = (as_of - latest).total_seconds() / 3600
     if hours <= 2:
@@ -691,6 +735,19 @@ def classify_intraday_freshness(
     if hours <= 6:
         return IntradayFreshnessStatus.DELAYED
     return IntradayFreshnessStatus.STALE
+
+
+def _market_closed_for_instrument(*, instrument: UniversalInstrument, as_of: datetime) -> bool:
+    """Prefer authoritative per-instrument session state over the UTC fallback."""
+    authoritative_open = {
+        "session-state:OPEN_TRADABLE",
+        "session-state:OPEN_NOT_TRADABLE",
+    }
+    if authoritative_open.intersection(instrument.tags):
+        return False
+    if "session-state:CLOSED" in instrument.tags:
+        return True
+    return _is_market_closed_as_of(as_of)
 
 
 def _expected_completed_one_hour_bar_timestamp(as_of: datetime) -> datetime:
@@ -826,6 +883,66 @@ def _bucket_for(decision: AegisDecision, confidence: Decimal) -> ActiveScannerBu
     if decision in {AegisDecision.HOLD, AegisDecision.IGNORE}:
         return ActiveScannerBucket.NO_TRADE
     return ActiveScannerBucket.REJECTED
+
+
+def _news_signal_from_context(
+    *,
+    instrument: UniversalInstrument,
+    context: object | None,
+    as_of: datetime,
+) -> NewsSignal | None:
+    """Translate global per-asset context into the scanner's typed news signal.
+
+    The global news engine is intentionally observational, but its result must
+    still be available to the strategy model.  Returning ``None`` is reserved
+    for an absent context; a present but empty context remains explicitly
+    data-insufficient and therefore cannot silently become positive evidence.
+    """
+    if context is None:
+        return None
+    if hasattr(context, "model_dump"):
+        payload = context.model_dump(mode="python")
+    elif isinstance(context, Mapping):
+        payload = dict(context)
+    else:
+        return None
+
+    raw_sentiment = str(payload.get("aggregate_sentiment", "NEUTRAL")).upper()
+    sentiment = (
+        Decimal("1")
+        if raw_sentiment == "POSITIVE"
+        else Decimal("-1")
+        if raw_sentiment == "NEGATIVE"
+        else Decimal("0")
+    )
+    unique_events = max(0, int(payload.get("unique_event_count", 0) or 0))
+    relevance = Decimal(str(payload.get("aggregate_relevance", "0") or "0"))
+    event_risk = Decimal(str(payload.get("event_risk", "0") or "0"))
+    freshness = str(payload.get("freshness", "NEWS_SOURCE_UNAVAILABLE"))
+    if unique_events <= 0:
+        status = (
+            NewsSignalStatus.NEWS_NOT_CONFIGURED
+            if freshness == "NEWS_SOURCE_UNAVAILABLE"
+            else NewsSignalStatus.DATA_INSUFFICIENT
+        )
+        confidence = Decimal("0")
+    else:
+        status = NewsSignalStatus.AVAILABLE
+        confidence = max(Decimal("0"), min(Decimal("1"), relevance))
+    return NewsSignal(
+        instrument=instrument,
+        timestamp=as_of,
+        status=status,
+        sentiment=sentiment if unique_events else None,
+        impact=max(Decimal("0"), min(Decimal("1"), max(relevance, event_risk)))
+        if unique_events
+        else None,
+        confidence=confidence,
+        source_quality=max(
+            Decimal("0"), min(Decimal("1"), Decimal(unique_events) / Decimal("3"))
+        ),
+        event_risks=(),
+    )
 
 
 def _instrument_id(instrument: UniversalInstrument) -> int:

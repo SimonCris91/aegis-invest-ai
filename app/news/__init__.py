@@ -9,6 +9,13 @@ from app.news.alpha_vantage import (
     alpha_vantage_symbol_to_aegis,
     news_provider_readiness_matrix,
 )
+from app.news.alpaca import (
+    ALPACA_API_KEY_ID_ENV,
+    ALPACA_API_SECRET_KEY_ENV,
+    ALPACA_NEWS_PROVIDER,
+    AlpacaNewsProvider,
+)
+from app.news.crosscheck import CrossCheckedNewsProvider
 from app.news.intelligence import (
     AssetNewsContext,
     GlobalNewsEventCategory,
@@ -34,6 +41,11 @@ __all__ = [
     "ALPHA_VANTAGE_NEWS_FUNCTION",
     "ALPHA_VANTAGE_PROVIDER",
     "AlphaVantageNewsProvider",
+    "ALPACA_API_KEY_ID_ENV",
+    "ALPACA_API_SECRET_KEY_ENV",
+    "ALPACA_NEWS_PROVIDER",
+    "AlpacaNewsProvider",
+    "CrossCheckedNewsProvider",
     "FakeNewsProvider",
     "FixtureNewsProvider",
     "GlobalNewsEventCategory",

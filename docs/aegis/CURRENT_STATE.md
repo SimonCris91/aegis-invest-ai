@@ -67,8 +67,10 @@ The next step must be selected explicitly.
 
 Do not automatically continue beyond STEP 9.0A3.
 
-Safety invariants remain:
+The scanner-foundation validation itself performed zero broker writes.
 
-broker_write_calls = 0
-Demo execution = OFF
-Real execution = unavailable
+Current runtime execution policy is defined authoritatively in `SAFETY.md`:
+
+- `READ_ONLY`: Demo and Real writes blocked
+- `DEMO_EXECUTION`: Demo writes permitted only after all normal Aegis guards
+- `REAL_EXECUTION`: unavailable

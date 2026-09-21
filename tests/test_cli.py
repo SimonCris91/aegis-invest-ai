@@ -97,3 +97,28 @@ def test_etoro_transport_check_cli_does_not_expose_identity(
     assert len(payload["proxy_environment"]) == 8
     assert "api-secret" not in json.dumps(payload)
     assert "user-secret" not in json.dumps(payload)
+
+
+def test_etoro_demo_runtime_once_command_fails_closed_without_credentials(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    values = {
+        "AEGIS_OPERATING_MODE": "ETORO_DEMO",
+        "ETORO_API_ENABLED": "true",
+        "ETORO_DEMO_EXECUTION_ENABLED": "true",
+        "AEGIS_BROKER_EXECUTION_MODE": "DEMO_EXECUTION",
+        "AEGIS_ETORO_DEMO_AUTOMATIC_PILOT_ENABLED": "true",
+        "AEGIS_ETORO_DEMO_PILOT_NOTIONAL_EUR": "10",
+    }
+
+    assert main(("etoro-demo-runtime-once",), values=values) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "BLOCKED"
+    assert payload["pilot_enabled"] is True
+    assert payload["blockers"] == ["ETORO_CREDENTIALS_NOT_CONFIGURED"]
+    assert payload["demo_broker_write_calls"] == 0
+    assert payload["broker_write_calls_real"] == 0

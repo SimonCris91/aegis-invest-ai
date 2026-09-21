@@ -6,6 +6,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
+from app.brokers.etoro.demo_execution import (
+    run_operational_demo_once,
+    run_user_confirmed_demo_validation,
+    verify_demo_validation_read_only,
+)
 from app.brokers.etoro.demo_preflight import (
     build_first_demo_preflight_report,
     default_demo_preflight_store,
@@ -27,7 +32,12 @@ from app.data.runtime import (
     build_alpaca_core_4h_backfill_report,
     build_alpaca_full_backfill_report,
     build_alpaca_provider_pilot_report,
+    build_etoro_broker_universe_discovery_report,
+    build_etoro_crypto_validation_report,
+    build_etoro_dynamic_active_universe,
+    build_etoro_instrument_catalog_probe_report,
     build_etoro_instrument_schema_report,
+    build_etoro_universe_bootstrap_report,
     build_exit_evidence_acquisition_report,
     build_exit_policy_v2_exposed_holdout_diagnostic_report,
     build_exit_policy_v2_train_validation_report,
@@ -43,17 +53,30 @@ from app.data.runtime import (
 from app.identity import AGENT_NAME, APPLICATION_NAME
 from app.intelligence.runtime import build_strategy_intelligence_report
 from app.news.runtime import build_alpha_vantage_news_adapter_report
-from app.orchestration.active_runtime import build_active_intelligence_orchestrator_report
+from app.orchestration.active_runtime import (
+    build_active_intelligence_orchestrator_report,
+    build_etoro_calibration_read_only_report,
+    build_etoro_demo_runtime_once_report,
+    build_etoro_demo_runtime_report,
+    build_etoro_full_catalog_candidate_calibration_read_only_report,
+    build_etoro_full_catalog_session_audit_report,
+    collect_etoro_calibration_evidence,
+    etoro_demo_runtime_status,
+    request_etoro_demo_runtime_stop,
+)
 from app.scanner.runtime import (
     DEFAULT_MARKET_SCAN_STORE_PATH,
     build_market_scan_report,
     default_market_scan_store,
 )
+from app.storage.sqlite import SqliteRecordStore
 from app.validation.runtime import build_strategy_validation_report
 from app.validation.storage import (
     DEFAULT_STRATEGY_VALIDATION_STORE_PATH,
     default_strategy_validation_store,
 )
+
+DEMO_VALIDATION_STORE_PATH = Path("work") / "etoro-demo-execution-validation.sqlite3"
 
 
 def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None = None) -> int:
@@ -79,6 +102,11 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
             "scan-markets",
             "strategy-intelligence",
             "intelligence-live",
+            "etoro-universe-discovery",
+            "etoro-instrument-catalog-probe",
+            "etoro-dynamic-universe-build",
+            "etoro-universe-bootstrap",
+            "etoro-crypto-validation-probe",
             "acquire-exit-evidence",
             "alpaca-core-4h-backfill",
             "alpaca-full-backfill",
@@ -100,6 +128,17 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
             "active-scanner-1h-iex-pilot",
             "alpha-vantage-news-adapter",
             "active-intelligence-orchestrator",
+            "etoro-demo-runtime-once",
+            "etoro-demo-runtime",
+            "etoro-demo-runtime-stop",
+            "etoro-demo-runtime-status",
+            "etoro-calibration-read-only",
+            "etoro-full-catalog-candidate-calibration-read-only",
+            "etoro-calibration-collector",
+            "etoro-full-catalog-session-audit",
+            "etoro-demo-execution-validate",
+            "etoro-demo-execution-once",
+            "etoro-demo-execution-verify",
         ),
     )
     parser.add_argument("--instrument", default=None)
@@ -112,6 +151,16 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--offline-fixture", action="store_true")
     parser.add_argument("--real-data", action="store_true")
+    parser.add_argument("--max-iterations", type=int, default=None)
+    parser.add_argument("--max-attempts", type=int, default=None)
+    parser.add_argument("--collection-interval-seconds", type=float, default=900.0)
+    parser.add_argument("--minimum-useful-runs", type=int, default=3)
+    parser.add_argument("--minimum-active-denominator", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--persist", action="store_true")
+    parser.add_argument("--confirm-demo-write", action="store_true")
+    parser.add_argument("--diagnose-live-quote", action="store_true")
+    parser.add_argument("--diagnose-demo-eligibility", action="store_true")
     args = parser.parse_args(argv)
     runtime_values = load_runtime_values(values)
     config = load_config(runtime_values)
@@ -224,6 +273,35 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
         payload = {
             "application": APPLICATION_NAME,
             **build_live_intelligence_report(config, values=runtime_values),
+        }
+    elif args.command == "etoro-universe-discovery":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_broker_universe_discovery_report(config, values=runtime_values),
+        }
+    elif args.command == "etoro-instrument-catalog-probe":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_instrument_catalog_probe_report(
+                config, values=runtime_values, persist=args.persist
+            ),
+        }
+    elif args.command == "etoro-dynamic-universe-build":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_dynamic_active_universe(),
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    elif args.command == "etoro-universe-bootstrap":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_universe_bootstrap_report(config, values=runtime_values),
+        }
+    elif args.command == "etoro-crypto-validation-probe":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_crypto_validation_report(config, values=runtime_values),
         }
     elif args.command == "acquire-exit-evidence":
         payload = {
@@ -402,6 +480,108 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
         payload = {
             "application": APPLICATION_NAME,
             **build_active_intelligence_orchestrator_report(config),
+        }
+    elif args.command == "etoro-demo-runtime-once":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_demo_runtime_once_report(config, values=runtime_values),
+        }
+    elif args.command == "etoro-calibration-read-only":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_calibration_read_only_report(
+                config,
+                values=runtime_values,
+                max_iterations=args.max_iterations or 1,
+            ),
+        }
+    elif args.command == "etoro-full-catalog-candidate-calibration-read-only":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_full_catalog_candidate_calibration_read_only_report(
+                config,
+                values=runtime_values,
+                max_iterations=args.max_iterations or 1,
+                acquisition_batch_size=args.batch_size,
+            ),
+        }
+    elif args.command == "etoro-calibration-collector":
+        payload = {
+            "application": APPLICATION_NAME,
+            **collect_etoro_calibration_evidence(
+                config,
+                values=runtime_values,
+                max_attempts=args.max_attempts,
+                interval_seconds=args.collection_interval_seconds,
+                minimum_useful_runs=args.minimum_useful_runs,
+                minimum_active_denominator=args.minimum_active_denominator,
+            ),
+        }
+    elif args.command == "etoro-full-catalog-session-audit":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_full_catalog_session_audit_report(
+                config,
+                values=runtime_values,
+                batch_size=args.batch_size,
+                concurrency=config.scanner.live_acquisition_concurrency,
+            ),
+        }
+    elif args.command == "etoro-demo-runtime":
+        payload = {
+            "application": APPLICATION_NAME,
+            **build_etoro_demo_runtime_report(
+                config,
+                values=runtime_values,
+                max_iterations=args.max_iterations,
+            ),
+        }
+    elif args.command == "etoro-demo-runtime-stop":
+        payload = {
+            "application": APPLICATION_NAME,
+            **request_etoro_demo_runtime_stop(),
+        }
+    elif args.command == "etoro-demo-runtime-status":
+        payload = {
+            "application": APPLICATION_NAME,
+            **etoro_demo_runtime_status(),
+        }
+    elif args.command == "etoro-demo-execution-validate":
+        payload = {
+            "application": APPLICATION_NAME,
+            **run_user_confirmed_demo_validation(
+                config,
+                values=runtime_values,
+                confirm_demo_write=args.confirm_demo_write,
+                store=SqliteRecordStore(DEMO_VALIDATION_STORE_PATH),
+            ),
+        }
+    elif args.command == "etoro-demo-execution-once" and args.diagnose_demo_eligibility:
+        from app.brokers.etoro.eligibility_diagnostic import diagnose_demo_eligibility
+
+        payload = {
+            "application": APPLICATION_NAME,
+            **diagnose_demo_eligibility(config, runtime_values),
+        }
+    elif args.command == "etoro-demo-execution-once":
+        payload = {
+            "application": APPLICATION_NAME,
+            **run_operational_demo_once(
+                config,
+                values=runtime_values,
+                confirm_demo_write=args.confirm_demo_write,
+                store=SqliteRecordStore(DEMO_VALIDATION_STORE_PATH),
+                diagnose_only=args.diagnose_live_quote,
+            ),
+        }
+    elif args.command == "etoro-demo-execution-verify":
+        payload = {
+            "application": APPLICATION_NAME,
+            **verify_demo_validation_read_only(
+                config,
+                values=runtime_values,
+                store=SqliteRecordStore(DEMO_VALIDATION_STORE_PATH),
+            ),
         }
     else:
         payload = {

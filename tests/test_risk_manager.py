@@ -14,7 +14,7 @@ from app.domain.enums import (
 from app.domain.market import InstrumentMetadata, PriceSnapshot
 from app.domain.portfolio import PortfolioSnapshot, Position
 from app.domain.proposals import TradeProposal
-from app.domain.risk import RiskContext, RiskEvaluation
+from app.domain.risk import AuthorizedCapitalEnvelope, RiskContext, RiskEvaluation
 from app.intelligence.confidence import V2_B_THRESHOLD, V2_B_THRESHOLD_PROVENANCE
 from app.reporting.audit import InMemoryAuditSink
 from app.risk.kill_switch import KillSwitch
@@ -40,6 +40,70 @@ def test_valid_proposal_is_approved_and_audited(
     assert evaluation.decision.violations == ()
     assert len(audit_sink.events) == 1
     assert audit_sink.events[0].result == "risk-approved"
+
+
+def test_risk_manager_owns_sizing_inside_authorized_capital_envelope(
+    risk_manager: RiskManager,
+    proposal: TradeProposal,
+    context: RiskContext,
+) -> None:
+    sized = risk_manager.evaluate_with_authorized_capital(
+        proposal.model_copy(update={"amount": Decimal("50")}),
+        context.model_copy(
+            update={
+                "capital_envelope": AuthorizedCapitalEnvelope(
+                    authorized_capital_eur=Decimal("15"),
+                    managed_exposure_eur=Decimal("12"),
+                )
+            }
+        ),
+    )
+
+    assert sized.decision.status is RiskDecisionStatus.APPROVED
+    assert sized.approved_notional_eur == Decimal("3")
+    assert sized.approved_proposal is not None
+    assert sized.approved_proposal.amount == Decimal("3")
+    assert sized.authorization is not None
+
+
+def test_missing_authorized_capital_fails_closed_even_with_account_cash(
+    risk_manager: RiskManager,
+    proposal: TradeProposal,
+    context: RiskContext,
+) -> None:
+    evaluation = risk_manager.evaluate_with_authorized_capital(proposal, context)
+
+    assert evaluation.decision.status is RiskDecisionStatus.REJECTED
+    assert RiskViolationCode.AUTHORIZED_CAPITAL_UNAVAILABLE in violation_codes(evaluation)
+    assert evaluation.authorization is None
+    assert evaluation.approved_notional_eur is None
+
+
+def test_authorized_capital_cannot_be_double_spent(
+    risk_manager: RiskManager,
+    proposal: TradeProposal,
+    context: RiskContext,
+) -> None:
+    envelope = AuthorizedCapitalEnvelope(
+        authorized_capital_eur=Decimal("15"), managed_exposure_eur=Decimal("12")
+    )
+    first = risk_manager.evaluate_with_authorized_capital(
+        proposal.model_copy(update={"amount": Decimal("10")}),
+        context.model_copy(update={"capital_envelope": envelope}),
+    )
+    second = risk_manager.evaluate_with_authorized_capital(
+        proposal.model_copy(update={"amount": Decimal("10")}),
+        context.model_copy(
+            update={
+                "capital_envelope": envelope.model_copy(
+                    update={"managed_exposure_eur": Decimal("15")}
+                )
+            }
+        ),
+    )
+
+    assert first.approved_notional_eur == Decimal("3")
+    assert RiskViolationCode.AUTHORIZED_CAPITAL_EXCEEDED in violation_codes(second)
 
 
 def test_no_leverage(

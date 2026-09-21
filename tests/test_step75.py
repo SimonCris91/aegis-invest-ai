@@ -24,6 +24,7 @@ from app.brokers.etoro.demo_execution import (
     DemoExecutionConfirmation,
     OneShotDemoExecutionWindow,
     arm_and_submit_confirmed_demo_once,
+    run_user_confirmed_demo_validation,
 )
 from app.brokers.etoro.demo_preflight import (
     CHECK_MARKET_CLOSED,
@@ -56,6 +57,7 @@ from app.brokers.reconciliation import ReconciliationError, reconcile_demo_state
 from app.config import ConfigLoadError, load_config
 from app.config.models import ApplicationConfig, RiskPolicyConfig
 from app.domain.enums import (
+    BrokerExecutionMode,
     Currency,
     ExecutionPolicy,
     HoldingPeriod,
@@ -101,6 +103,7 @@ class FakeReadClient:
         self._quote = quote or _quote()
         self._eligibility = eligibility or _eligibility()
         self._order_state = order_state
+        self.last_server_now: datetime | None = None
         self.calls: list[str] = []
 
     def identity(self) -> BrokerIdentity:
@@ -121,6 +124,12 @@ class FakeReadClient:
         self, symbol: str, *, as_of: datetime | None = None
     ) -> InstrumentResolution:
         self.calls.append("resolve_instrument")
+        return self._resolution
+
+    def resolve_instrument_id(
+        self, instrument_id: int, *, symbol: str | None = None, as_of: datetime | None = None
+    ) -> InstrumentResolution:
+        self.calls.append("resolve_instrument_id")
         return self._resolution
 
     def quote(self, instrument_id: int, symbol: str) -> MarketQuote:
@@ -298,6 +307,17 @@ def _config(
         etoro_api_enabled=True,
         kill_switch=kill_switch,
         risk=risk or RiskPolicyConfig(),
+    )
+
+
+def _execution_config() -> ApplicationConfig:
+    return ApplicationConfig(
+        operating_mode=OperatingMode.ETORO_DEMO,
+        authorized_capital_eur=Decimal("2000"),
+        etoro_api_enabled=True,
+        etoro_demo_execution_enabled=True,
+        broker_execution_mode=BrokerExecutionMode.DEMO_EXECUTION,
+        kill_switch=True,
     )
 
 
@@ -881,7 +901,119 @@ def test_preflight_stops_on_market_closed_before_eligibility(tmp_path: Path) -> 
     assert report.pre_flight == PREFLIGHT_FAIL
     assert report.blocker_code == "MARKET_OR_ELIGIBILITY_BLOCK"
     assert market.status == CHECK_MARKET_CLOSED
+    assert market.metadata == {"market_status": MarketStatus.CLOSED.value}
+    assert "market_rates" not in {check.name for check in report.checks}
     assert "demo_eligibility" not in client.calls
+
+
+def test_user_demo_validation_reports_market_closed_exactly(tmp_path: Path) -> None:
+    client = FakeReadClient(
+        resolution=_resolution(market_status=MarketStatus.CLOSED),
+        quote=_quote(
+            market_status=MarketStatus.CLOSED,
+            as_of=_now() - timedelta(minutes=20),
+        ),
+    )
+
+    result = run_user_confirmed_demo_validation(
+        _execution_config(),
+        values=_values(),
+        confirm_demo_write=True,
+        store=SqliteRecordStore(tmp_path / "validation.sqlite3"),
+        client=cast(EtoroReadClient, client),
+        news_provider=PositiveNewsProvider(),
+        clock=_now,
+    )
+
+    assert result["status"] == "PREFLIGHT_BLOCKED"
+    assert result["failed_check"] == "market_state"
+    assert result["failure_code"] == "MARKET_CLOSED"
+    assert "not open" in str(result["failure_reason"])
+    assert result["demo_submission_attempts"] == 0
+
+
+def test_user_demo_validation_forwards_hold_rationale(tmp_path: Path) -> None:
+    class Client(FakeReadClient):
+        last_server_now = _now()
+
+    result = run_user_confirmed_demo_validation(
+        _execution_config(),
+        values=_values(),
+        confirm_demo_write=True,
+        store=SqliteRecordStore(tmp_path / "validation.sqlite3"),
+        client=cast(EtoroReadClient, Client()),
+        agent=HoldAgent(),
+        news_provider=PositiveNewsProvider(),
+        clock=_now,
+    )
+
+    assert result["status"] == "PREFLIGHT_BLOCKED"
+    assert result["failed_check"] == "aegis_agent"
+    assert result["aegis_agent_rationale"] == "test hold"
+    assert result["demo_submission_attempts"] == 0
+    assert result["demo_write_performed"] is False
+    assert result["real_write_performed"] is False
+
+
+def test_user_demo_validation_valid_request_submits_once_with_mocked_transport(
+    tmp_path: Path,
+) -> None:
+    transport = SequencedTransport([HttpResponse(202, {}, b'{"orderId":"order-1"}')])
+
+    result = run_user_confirmed_demo_validation(
+        _execution_config(),
+        values=_values(),
+        confirm_demo_write=True,
+        store=SqliteRecordStore(tmp_path / "validation.sqlite3"),
+        client=cast(EtoroReadClient, FakeReadClient()),
+        news_provider=PositiveNewsProvider(),
+        http=DisciplinedHttpClient(transport),
+        clock=_now,
+    )
+
+    assert result["status"] == ExecutionState.FILLED.value
+    assert result["failed_check"] is None
+    assert result["demo_submission_attempts"] == 1
+    assert result["demo_write_performed"] is True
+    assert result["real_write_performed"] is False
+    assert len(transport.calls) == 1
+
+
+def test_user_demo_validation_missing_credentials_reports_exact_check(tmp_path: Path) -> None:
+    result = run_user_confirmed_demo_validation(
+        _execution_config(),
+        values={},
+        confirm_demo_write=True,
+        store=SqliteRecordStore(tmp_path / "validation.sqlite3"),
+        client=cast(EtoroReadClient, FakeReadClient()),
+        clock=_now,
+    )
+
+    assert result["status"] == "PREFLIGHT_BLOCKED"
+    assert result["failed_check"] == "credentials"
+    assert result["failure_code"] == "CREDENTIALS"
+    assert result["demo_submission_attempts"] == 0
+
+
+def test_user_demo_validation_duplicate_reservation_fails_closed(tmp_path: Path) -> None:
+    store = SqliteRecordStore(tmp_path / "validation.sqlite3")
+    assert store.reserve_demo_submission(
+        "existing-cycle|TEST|OPEN",
+        {"instrument_id": TEST_INSTRUMENT_ID, "amount_eur": "5", "action": "OPEN"},
+    )
+
+    result = run_user_confirmed_demo_validation(
+        _execution_config(),
+        values=_values(),
+        confirm_demo_write=True,
+        store=store,
+        client=cast(EtoroReadClient, FakeReadClient()),
+        clock=_now,
+    )
+
+    assert result["status"] == "PREFLIGHT_BLOCKED"
+    assert result["failed_check"] == "restart_replay_guard"
+    assert result["demo_submission_attempts"] == 0
 
 
 def test_preflight_stops_on_ineligible_instrument(tmp_path: Path) -> None:
@@ -1082,10 +1214,13 @@ def test_preflight_rejects_position_exposure_violation(tmp_path: Path) -> None:
 
 
 def test_preflight_does_not_force_trade_when_agent_holds(tmp_path: Path) -> None:
+    class Client(FakeReadClient):
+        last_server_now = _now()
+
     report = build_first_demo_preflight_report(
         _config(),
         values=_values(),
-        client=cast(EtoroReadClient, FakeReadClient()),
+        client=cast(EtoroReadClient, Client()),
         agent=HoldAgent(),
         store=SqliteRecordStore(tmp_path / "preflight.sqlite3"),
         clock=_now,
@@ -1093,6 +1228,7 @@ def test_preflight_does_not_force_trade_when_agent_holds(tmp_path: Path) -> None
 
     assert report.pre_flight == PREFLIGHT_FAIL
     assert report.aegis_agent_confidence == Decimal("0")
+    assert report.aegis_agent_rationale == "test hold"
     assert report.proposed_action is None
 
 
@@ -1382,6 +1518,34 @@ def test_demo_adapter_checks_kill_switch_immediately_before_http(tmp_path: Path)
     assert transport.calls == []
 
 
+def test_demo_adapter_revalidates_tradability_after_reservation(tmp_path: Path) -> None:
+    now = _now()
+    switch = KillSwitch(active=False, reason="test", clock=lambda: now)
+    proposal = _proposal()
+    gate, admitted = _admitted_trade(proposal, switch, now)
+    store = SqliteRecordStore(tmp_path / "demo.sqlite3")
+    transport = SequencedTransport([HttpResponse(202, {}, b'{"orderId":"order-1"}')])
+    adapter = EtoroDemoAdapter(
+        credentials=EtoroCredentials(api_key="api", user_key="user"),
+        http=DisciplinedHttpClient(transport),
+        gate=gate,
+        kill_switch=switch,
+        registry=store,
+        enabled=True,
+        explicit_opt_in=True,
+        clock=lambda: now,
+        tradability_revalidator=lambda instrument_id, symbol, as_of: False,
+    )
+
+    with pytest.raises(DemoExecutionError, match="tradability"):
+        adapter.submit_demo(
+            admitted, PreflightDecision(allowed=True, minimum_trade_amount=Decimal("5"))
+        )
+
+    assert transport.calls == []
+    assert store.demo_submission(proposal.idempotency_key)["state"] == ExecutionState.REJECTED.value
+
+
 def test_wrong_environment_is_rejected_by_configuration() -> None:
     with pytest.raises(ConfigLoadError):
         load_config({"AEGIS_ENVIRONMENT": "PRODUCTION"})
@@ -1389,10 +1553,12 @@ def test_wrong_environment_is_rejected_by_configuration() -> None:
 
 def test_lookalike_or_incorrect_demo_route_is_rejected() -> None:
     assert_demo_route(DEMO_ORDER_URL)
+    assert DEMO_ORDER_URL == "https://public-api.etoro.com/api/v2/trading/execution/demo/orders"
     for url in (
-        "http://public-api.etoro.com/api/v3/trading/execution/demo/orders",
-        "https://public-api.etoro.com/api/v3/trading/execution/orders",
-        "https://public-api.etoro.com/api/v3/trading/execution/demo/orders/extra",
+        "http://public-api.etoro.com/api/v2/trading/execution/demo/orders",
+        "https://public-api.etoro.com/api/v3/trading/execution/demo/orders",
+        "https://public-api.etoro.com/api/v2/trading/execution/orders",
+        "https://public-api.etoro.com/api/v2/trading/execution/demo/orders/extra",
     ):
         with pytest.raises(DemoExecutionError):
             assert_demo_route(url)

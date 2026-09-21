@@ -4,18 +4,22 @@ These invariants are mandatory.
 
 ## Execution
 
-broker_write_calls = 0
-Demo execution = OFF
-Real execution = unavailable
+Execution mode must be explicit:
+
+- `READ_ONLY`: Demo writes prohibited; Real writes prohibited.
+- `DEMO_EXECUTION`: eToro Demo writes permitted only for genuine accepted opportunities after
+  RiskManager sizing, execution admission, durable idempotency and authorized-capital checks.
+- `REAL_EXECUTION`: unavailable.
 
 Never:
 
 - place real orders
-- place Demo orders
+- fall back from Demo to Real
 - enable production trading
 - modify broker credentials
 - create an implicit broker write path
 - silently enable execution
+- bypass RiskManager, sizing, admission, idempotency or the authorized-capital envelope
 
 Provider and market-data APIs may only be used read-only where authorized.
 

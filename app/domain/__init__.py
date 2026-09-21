@@ -5,6 +5,7 @@ from app.domain.market import EvidenceItem, InstrumentMetadata, MarketQuote, New
 from app.domain.portfolio import PortfolioSnapshot, Position
 from app.domain.proposals import TradeProposal
 from app.domain.risk import (
+    AuthorizedCapitalEnvelope,
     RiskAuthorization,
     RiskContext,
     RiskDecision,
@@ -22,6 +23,7 @@ __all__ = [
     "Position",
     "PriceSnapshot",
     "RiskAuthorization",
+    "AuthorizedCapitalEnvelope",
     "RiskContext",
     "RiskDecision",
     "RiskEvaluation",

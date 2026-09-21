@@ -2,7 +2,11 @@
 
 import hashlib
 import inspect
+import json
+import os
 import sys
+import tempfile
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -35,7 +39,10 @@ from app.config.models import ApplicationConfig
 from app.data.events.engine import NullEventRiskProvider
 from app.data.historical.alpaca import AlpacaHistoricalMarketDataProvider
 from app.data.historical.cache import HistoricalDataCache
-from app.data.historical.etoro import EtoroHistoricalMarketDataProvider
+from app.data.historical.etoro import (
+    EtoroHistoricalMarketDataProvider,
+    _normalize_etoro_candles,
+)
 from app.data.historical.polygon import PolygonHistoricalMarketDataProvider
 from app.data.historical.providers import HttpTextTransport, StooqHistoricalDataProvider
 from app.data.mapping import InstrumentMappingService
@@ -54,13 +61,24 @@ from app.data.registry import (
     HistoricalProviderEntry,
     NewsProviderRegistry,
 )
-from app.domain.enums import AssetClass, Currency, MarketStatus, SettlementType, TradeIntent
+from app.domain.enums import (
+    AssetClass,
+    Currency,
+    MarketStatus,
+    SettlementType,
+    TradeIntent,
+)
 from app.domain.portfolio import PortfolioSnapshot, Position
 from app.domain.universe import UniversalInstrument
 from app.domain.versions import RANKING_VERSION
 from app.intelligence.models import MarketBar, TimeFrame
 from app.intelligence.profiles import profile_for
 from app.intelligence.research import default_strategy_research_store
+from app.orchestration.active_intelligence import (
+    ActiveIntelligenceAuditStore,
+    AegisActiveIntelligenceOrchestrator,
+    default_active_intelligence_audit_store,
+)
 from app.policies.defaults import default_asset_policy_engine
 from app.policies.engine import AssetPolicyEngine
 from app.scanner.active import (
@@ -83,6 +101,7 @@ from app.scanner.models import ScannerLimits
 from app.scanner.ranking import OpportunityRankingEngine
 from app.scanner.runtime import _portfolio_from_demo
 from app.scanner.service import OpenMarketCandidateScanner
+from app.storage.sqlite import SqliteRecordStore, assert_secret_free
 from app.validation.confidence import build_confidence_ablation_study
 from app.validation.datasets import (
     build_real_historical_validation_datasets,
@@ -113,6 +132,10 @@ from app.validation.storage import (
 )
 
 DEFAULT_MARKET_DATA_CACHE_PATH = Path("work") / "market-data-cache.sqlite3"
+DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH = Path("work") / "etoro-instrument-catalog.json"
+DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH = Path("work") / "etoro-active-universe.json"
+DEFAULT_ETORO_UNIVERSE_BOOTSTRAP_PATH = Path("work") / "etoro-universe-bootstrap.json"
+DEFAULT_ETORO_CRYPTO_VALIDATION_PATH = Path("work") / "etoro-crypto-validation.json"
 REAL_VALIDATION_RUNTIME_VERSION = "real-validation-runtime-v3"
 POLICY_ADMISSION_SOURCE = "canonical-asset-policy-engine"
 EXITPOLICY_V2_BALANCED_CANDIDATE_FINGERPRINT = (
@@ -257,6 +280,9 @@ ALPACA_CORE_4H_BACKFILL_YEARS = 3
 ACTIVE_SCANNER_1H_LOOKBACK_BARS = 120
 ACTIVE_SCANNER_1H_MINIMUM_BARS = 60
 ACTIVE_SCANNER_1H_READINESS_SWEEP_DAYS = 15
+ETORO_UNIVERSE_BOOTSTRAP_BARS = 120
+ETORO_UNIVERSE_BOOTSTRAP_BATCH_SIZE = 25
+ETORO_UNIVERSE_BOOTSTRAP_DELAY_SECONDS = 0.25
 
 
 def build_live_intelligence_report(
@@ -401,6 +427,1266 @@ def build_live_intelligence_report(
             r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
             r" && .venv\Scripts\python.exe -m app.main intelligence-live"
         ),
+    }
+
+
+def build_etoro_broker_universe_discovery_report(
+    config: ApplicationConfig,
+    *,
+    values: Mapping[str, str] | None = None,
+    client: EtoroReadClient | None = None,
+    clock: Callable[[], datetime] | None = None,
+    discovery_limit: int | None = None,
+) -> dict[str, object]:
+    """Discover broker instruments without changing the active scanner universe."""
+    now = (clock or (lambda: datetime.now(UTC)))()
+    if config.etoro_demo_execution_enabled:
+        return {
+            "status": "BLOCKED",
+            "blocker": "DEMO_EXECUTION_ENABLED",
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    credentials = runtime_credentials(values)
+    if client is None and credentials is None:
+        return {
+            "status": "BLOCKED",
+            "blocker": "ETORO_CREDENTIALS_NOT_CONFIGURED",
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    if client is None and not config.etoro_api_enabled:
+        return {
+            "status": "BLOCKED",
+            "blocker": "ETORO_API_DISABLED",
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    if client is not None:
+        read_client = client
+    else:
+        assert credentials is not None
+        read_client = EtoroReadClient(
+            credentials,
+            DisciplinedHttpClient(UrllibTransport(config.etoro_transport_mode)),
+        )
+    limit = discovery_limit or config.scanner.discovery_limit
+    page_size = min(limit, 100)
+    discovered: list[UniversalInstrument] = []
+    pages_fetched = 0
+    page_identity_sets: set[tuple[str, ...]] = set()
+    try:
+        for page_number in range(1, config.scanner.etoro_max_pages + 1):
+            page = read_client.discover_instruments(
+                as_of=now,
+                page_size=page_size,
+                page_number=page_number,
+                search_text=config.scanner.etoro_search_text,
+            )
+            pages_fetched += 1
+            page_ids = tuple(item.broker_instrument_id for item in page)
+            if page_ids and page_ids in page_identity_sets:
+                return {
+                    "status": "BLOCKED",
+                    "blocker": "ETORO_DISCOVERY_PAGINATION_STALLED",
+                    "pages_fetched": pages_fetched,
+                    "pagination_verified": False,
+                    "broker_write_calls": 0,
+                    "real_execution_available": False,
+                }
+            page_identity_sets.add(page_ids)
+            discovered.extend(page)
+            if len(discovered) >= limit or not page:
+                break
+    except EtoroApiError as exc:
+        return {
+            "status": "BLOCKED",
+            "blocker": exc.category.value,
+            "endpoint": exc.endpoint,
+            "http_status": exc.status,
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    unique: dict[str, UniversalInstrument] = {}
+    duplicate_ids: list[str] = []
+    for instrument in discovered[:limit]:
+        key = instrument.broker_instrument_id
+        if key in unique:
+            duplicate_ids.append(key)
+            continue
+        unique[key] = instrument
+    instruments = tuple(unique.values())
+    rows = tuple(_etoro_discovery_row(item) for item in instruments)
+    counts = {
+        asset_class.value: sum(1 for item in instruments if item.asset_class is asset_class)
+        for asset_class in AssetClass
+        if any(item.asset_class is asset_class for item in instruments)
+    }
+    baseline = tuple(
+        symbol for symbols in EXIT_EVIDENCE_SYMBOLS_BY_CLASS.values() for symbol in symbols
+    )
+    verified = tuple(row for row in rows if row["mapping_status"] == "VERIFIED")
+    data_ready = tuple(row for row in verified if row["market_data_status"] == "MARKET_DATA_READY")
+    return {
+        "status": "READ_ONLY_DISCOVERY_COMPLETE",
+        "source": "eToro official GET /api/v1/market-data/search",
+        "as_of": now.isoformat(),
+        "pages_fetched": pages_fetched,
+        "pagination_verified": pages_fetched > 1,
+        "discovered_count": len(instruments),
+        "counts_by_asset_class": counts,
+        "duplicate_instrument_ids": tuple(sorted(set(duplicate_ids))),
+        "validated_baseline_symbols": baseline,
+        "validated_baseline_unchanged": True,
+        "etoro_discovered": tuple(row["instrument"] for row in rows),
+        "verified_mapping": tuple(row["instrument"] for row in verified),
+        "market_data_ready": tuple(row["instrument"] for row in data_ready),
+        "expansion_candidates": tuple(
+            row["instrument"]
+            for row in rows
+            if row["mapping_status"] == "VERIFIED"
+            and row["market_data_status"] == "MARKET_DATA_READY"
+        ),
+        "mapping_rows": rows,
+        "broker_write_calls": 0,
+        "demo_execution_enabled": config.etoro_demo_execution_enabled,
+        "real_execution_available": False,
+    }
+
+
+def build_etoro_instrument_catalog_probe_report(
+    config: ApplicationConfig,
+    *,
+    values: Mapping[str, str] | None = None,
+    client: EtoroReadClient | None = None,
+    persist: bool = False,
+    snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+) -> dict[str, object]:
+    """Perform one sanitized, unfiltered eToro instrument-catalog GET."""
+    credentials = runtime_credentials(values)
+    if client is None and credentials is None:
+        return {
+            "status": "BLOCKED",
+            "blocker": "ETORO_CREDENTIALS_NOT_CONFIGURED",
+            "broker_write_calls": 0,
+        }
+    if client is None and not config.etoro_api_enabled:
+        return {"status": "BLOCKED", "blocker": "ETORO_API_DISABLED", "broker_write_calls": 0}
+    if client is not None:
+        read_client = client
+    else:
+        assert credentials is not None
+        read_client = EtoroReadClient(
+            credentials,
+            DisciplinedHttpClient(UrllibTransport(config.etoro_transport_mode)),
+        )
+    try:
+        raw = read_client.instrument_display_data()
+    except EtoroApiError as exc:
+        return {
+            "status": "BLOCKED",
+            "blocker": exc.category.value,
+            "http_status": exc.status,
+            "endpoint": exc.endpoint,
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    items = _catalog_items(raw)
+    if not isinstance(raw, dict) or not isinstance(raw.get("instrumentDisplayDatas"), list):
+        return {
+            "status": "BLOCKED",
+            "blocker": "MALFORMED_CATALOG_RESPONSE",
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    if any(not _catalog_value(item, "instrumentID", "instrumentId") for item in items):
+        return {
+            "status": "BLOCKED",
+            "blocker": "CATALOG_RECORD_MISSING_INSTRUMENT_ID",
+            "broker_write_calls": 0,
+            "real_execution_available": False,
+        }
+    ids = tuple(_catalog_value(item, "instrumentID", "instrumentId") for item in items)
+    type_ids = tuple(_catalog_value(item, "instrumentTypeID", "instrumentTypeId") for item in items)
+    exchange_ids = tuple(_catalog_value(item, "exchangeID", "exchangeId") for item in items)
+    report: dict[str, object] = {
+        "status": "READ_ONLY_CATALOG_PROBE_COMPLETE",
+        "endpoint": "/api/v1/market-data/instruments",
+        "instrument_display_data_count": len(items),
+        "unique_instrument_id_count": len(set(ids)),
+        "duplicate_instrument_id_count": len(ids) - len(set(ids)),
+        "first_symbols": tuple(
+            value
+            for value in (
+                _catalog_value(item, "internalSymbolFull", "symbol") for item in items[:10]
+            )
+            if value is not None
+        ),
+        "instrument_type_id_distribution": _catalog_distribution(type_ids),
+        "exchange_id_distribution": _catalog_distribution(exchange_ids),
+        "broker_write_calls": 0,
+        "real_execution_available": False,
+    }
+    if persist:
+        try:
+            snapshot = persist_etoro_instrument_catalog_snapshot(
+                raw, retrieved_at=datetime.now(UTC), path=snapshot_path
+            )
+        except (OSError, ValueError) as exc:
+            return {
+                **report,
+                "status": "BLOCKED",
+                "blocker": "CATALOG_SNAPSHOT_PERSISTENCE_FAILED",
+                "persistence_error_type": type(exc).__name__,
+                "persistence_error": str(exc),
+            }
+        report.update(
+            {
+                "snapshot_status": "PERSISTED",
+                "snapshot_path": str(snapshot_path),
+                **snapshot,
+            }
+        )
+    else:
+        report["snapshot_status"] = "NOT_REQUESTED"
+    return report
+
+
+def persist_etoro_instrument_catalog_snapshot(
+    raw: object,
+    *,
+    retrieved_at: datetime,
+    path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+) -> dict[str, object]:
+    """Atomically persist one complete, secret-free eToro catalog response."""
+    if retrieved_at.tzinfo is None:
+        raise ValueError("retrieved_at must be timezone-aware")
+    if not isinstance(raw, dict) or not isinstance(raw.get("instrumentDisplayDatas"), list):
+        raise ValueError("catalog response must contain instrumentDisplayDatas")
+    records = raw["instrumentDisplayDatas"]
+    if any(not isinstance(record, dict) for record in records):
+        raise ValueError("catalog records must be objects")
+    typed_records = tuple(cast(dict[str, object], record) for record in records)
+    instrument_ids = tuple(
+        _catalog_value(record, "instrumentID", "instrumentId") for record in typed_records
+    )
+    if any(not instrument_id for instrument_id in instrument_ids):
+        raise ValueError("catalog record is missing instrument ID")
+    assert_secret_free(typed_records)
+    canonical_payload = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    checksum = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    snapshot = {
+        "schema_version": 1,
+        "snapshot_id": checksum[:16],
+        "snapshot_checksum_sha256": checksum,
+        "retrieved_at": retrieved_at.isoformat(),
+        "source_endpoint": "/api/v1/market-data/instruments",
+        "raw_count": len(typed_records),
+        "unique_instrument_id_count": len(set(instrument_ids)),
+        "duplicate_instrument_id_count": len(instrument_ids) - len(set(instrument_ids)),
+        "raw_response": raw,
+        "instrument_display_datas": typed_records,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as temporary:
+            temporary_path = temporary.name
+            json.dump(snapshot, temporary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return {key: value for key, value in snapshot.items() if key != "instrument_display_datas"}
+
+
+def read_etoro_instrument_catalog_snapshot(
+    path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+) -> dict[str, object] | None:
+    """Read the last complete catalog snapshot without network access."""
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        snapshot = json.load(handle)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("raw_response"), dict):
+        raise ValueError("invalid catalog snapshot")
+    if not isinstance(snapshot.get("instrument_display_datas"), list):
+        raise ValueError("invalid catalog snapshot records")
+    return snapshot
+
+
+def _atomic_json_write(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as temporary:
+            temporary_path = temporary.name
+            json.dump(payload, temporary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _validated_etoro_catalog_items(
+    snapshot_path: Path,
+) -> tuple[dict[str, object], ...]:
+    snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
+    if snapshot is None:
+        raise ValueError("ETORO_CATALOG_SNAPSHOT_MISSING")
+    raw = snapshot["raw_response"]
+    items = _catalog_items(raw)
+    checksum = hashlib.sha256(
+        json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    ids = {_catalog_value(item, "instrumentID", "instrumentId") for item in items}
+    if (
+        checksum != snapshot.get("snapshot_checksum_sha256")
+        or int(str(snapshot.get("raw_count", -1))) != len(items)
+        or int(str(snapshot.get("unique_instrument_id_count", -1))) != len(ids)
+        or int(str(snapshot.get("duplicate_instrument_id_count", -1))) != len(items) - len(ids)
+    ):
+        raise ValueError("ETORO_CATALOG_SNAPSHOT_INVALID")
+    return items
+
+
+def _etoro_bootstrap_instrument(
+    item: dict[str, object], *, snapshot_id: str, now: datetime
+) -> UniversalInstrument:
+    instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
+    symbol = _catalog_value(item, "symbolFull")
+    normalized_class = _catalog_asset_class(item)
+    return UniversalInstrument(
+        broker="etoro",
+        broker_instrument_id=instrument_id,
+        symbol=symbol,
+        display_name=_catalog_value(item, "instrumentDisplayName") or symbol,
+        asset_class=AssetClass(normalized_class),
+        currency=Currency.USD,
+        market_status=(
+            MarketStatus.CONTINUOUS_24_7
+            if normalized_class == AssetClass.CRYPTO.value
+            else MarketStatus.UNKNOWN
+        ),
+        tradeable=None,
+        buy_allowed=None,
+        sell_allowed=None,
+        short_allowed=None,
+        leverage_available=None,
+        max_leverage=Decimal("1"),
+        settlement_type=None,
+        minimum_order_value=None,
+        minimum_quantity=None,
+        quantity_type=None,
+        fractional_supported=None,
+        metadata_timestamp=now,
+        tags=("etoro-native-bootstrap", f"catalog-snapshot:{snapshot_id}"),
+    )
+
+
+def _etoro_bootstrap_reference(
+    item: dict[str, object], *, snapshot_id: str, asset_class: AssetClass
+) -> ProviderInstrumentReference:
+    symbol = _catalog_value(item, "symbolFull")
+    instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
+    return ProviderInstrumentReference(
+        provider="etoro",
+        provider_symbol=symbol,
+        broker="etoro",
+        broker_symbol=symbol,
+        broker_instrument_id=instrument_id,
+        exchange=None,
+        asset_class=asset_class,
+        currency=Currency.USD,
+        mapping_confidence=Decimal("1"),
+        mapping_source=f"etoro-catalog-snapshot:{snapshot_id}",
+        verified=True,
+    )
+
+
+def _write_etoro_native_active_artifact(
+    *,
+    snapshot: Mapping[str, object],
+    progress_records: list[dict[str, object]],
+    artifact_path: Path,
+    created_at: datetime,
+) -> dict[str, object]:
+    active_records: list[dict[str, object]] = []
+    catalog_by_id = {
+        _catalog_value(item, "instrumentID", "instrumentId"): item
+        for item in _catalog_items(snapshot.get("raw_response"))
+    }
+    for record in progress_records:
+        if record.get("status") != "BOOTSTRAPPED":
+            continue
+        catalog_item = catalog_by_id.get(str(record["instrument_id"]))
+        if catalog_item is not None and catalog_item.get("isInternalInstrument") is True:
+            continue
+        active_records.append(
+            {
+                "etoro_instrument_id": record["instrument_id"],
+                "symbol": record["symbol"],
+                "display_name": record["display_name"],
+                "normalized_asset_class": record["asset_class"],
+                "mapping_status": "VERIFIED",
+                "coverage_status": "MARKET_DATA_READY",
+                "universe_state": "ACTIVE_SCANNER_READY",
+                "inclusion_reason": "ETORO_NATIVE_1D_AND_1H_BOOTSTRAPPED",
+                "market_data_provider": "etoro",
+                "provider_symbol": record["symbol"],
+                "provider_instrument_id": record["instrument_id"],
+                "mapping_source": f"etoro-catalog-snapshot:{snapshot['snapshot_id']}",
+                "source_snapshot_id": snapshot["snapshot_id"],
+            }
+        )
+    active_records.sort(key=lambda item: (str(item["symbol"]), str(item["etoro_instrument_id"])))
+    state_counts = Counter(str(record["status"]) for record in progress_records)
+    artifact: dict[str, object] = {
+        "schema_version": 2,
+        "universe_source": "etoro-native-bootstrap",
+        "created_at": created_at.isoformat(),
+        "source_snapshot_id": snapshot["snapshot_id"],
+        "source_snapshot_checksum_sha256": snapshot["snapshot_checksum_sha256"],
+        "catalog_instrument_count": int(str(snapshot["raw_count"])),
+        "verified_mapping_count": sum(
+            str(record["status"]) == "BOOTSTRAPPED"
+            and catalog_by_id.get(str(record["instrument_id"]), {}).get("isInternalInstrument")
+            is not True
+            for record in progress_records
+        ),
+        "market_data_ready_count": len(active_records),
+        "active_scanner_universe_count": len(active_records),
+        "blocked_count": len(progress_records) - len(active_records),
+        "catalog_pending_count": max(0, len(catalog_by_id) - len(progress_records)),
+        "catalog_not_ready_count": max(0, len(catalog_by_id) - len(active_records)),
+        "bootstrap_status_counts": dict(sorted(state_counts.items())),
+        "records": progress_records,
+        "active_records": active_records,
+    }
+    assert_secret_free(artifact)
+    _atomic_json_write(artifact_path, artifact)
+    return artifact
+
+
+def build_etoro_universe_bootstrap_report(
+    config: ApplicationConfig,
+    *,
+    values: Mapping[str, str] | None = None,
+    client: EtoroReadClient | None = None,
+    cache: HistoricalDataCache | None = None,
+    snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+    progress_path: Path = DEFAULT_ETORO_UNIVERSE_BOOTSTRAP_PATH,
+    artifact_path: Path = DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH,
+    clock: Callable[[], datetime] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    batch_size: int = ETORO_UNIVERSE_BOOTSTRAP_BATCH_SIZE,
+    delay_seconds: float = ETORO_UNIVERSE_BOOTSTRAP_DELAY_SECONDS,
+) -> dict[str, object]:
+    """Bootstrap eToro-native scanner data without touching execution paths."""
+    if batch_size <= 0 or delay_seconds < 0:
+        raise ValueError("invalid bootstrap pacing")
+    now = (clock or (lambda: datetime.now(UTC)))()
+    items = _validated_etoro_catalog_items(snapshot_path)
+    snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
+    assert snapshot is not None
+    snapshot_id = str(snapshot["snapshot_id"])
+    progress: dict[str, dict[str, object]] = {}
+    if progress_path.exists():
+        with progress_path.open(encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if isinstance(existing, dict) and existing.get("source_snapshot_id") == snapshot_id:
+            raw_records = existing.get("records", [])
+            if isinstance(raw_records, list):
+                progress = {
+                    str(record["instrument_id"]): record
+                    for record in raw_records
+                    if isinstance(record, dict) and record.get("instrument_id") is not None
+                }
+    effective_cache = cache or HistoricalDataCache(DEFAULT_MARKET_DATA_CACHE_PATH)
+    read_client = client
+    if read_client is None:
+        credentials = runtime_credentials(values)
+        if credentials is None:
+            return {
+                "status": "ETORO_CREDENTIALS_NOT_CONFIGURED",
+                "catalog_count": len(items),
+                "checked": 0,
+                "data_capable": 0,
+                "bootstrapped": sum(
+                    record.get("status") == "BOOTSTRAPPED" for record in progress.values()
+                ),
+                "active_scanner_universe": 0,
+                "broker_write_calls": 0,
+                "real_execution_available": False,
+            }
+        if not config.etoro_api_enabled:
+            return {
+                "status": "ETORO_API_DISABLED",
+                "catalog_count": len(items),
+                "checked": 0,
+                "data_capable": 0,
+                "bootstrapped": 0,
+                "active_scanner_universe": 0,
+                "broker_write_calls": 0,
+                "real_execution_available": False,
+            }
+        read_client = EtoroReadClient(
+            credentials,
+            # Bootstrap is resumable and must not spend three full HTTP retry
+            # windows on one instrument before moving to the next one.  A
+            # failed record is persisted as ERROR_RETRYABLE and revisited by
+            # a later retry pass.
+            DisciplinedHttpClient(
+                UrllibTransport(config.etoro_transport_mode), max_read_attempts=1
+            ),
+        )
+    assert read_client is not None
+    progress_items: list[dict[str, object]] = [progress[key] for key in sorted(progress)]
+    terminal_statuses = {
+        "BOOTSTRAPPED",
+        "NO_DATA",
+        "ERROR_RETRYABLE",
+        "UNSUPPORTED",
+        "UNSUPPORTED_INTERNAL",
+    }
+    for index, item in enumerate(items):
+        instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
+        symbol = _catalog_value(item, "symbolFull")
+        normalized_class = _catalog_asset_class(item)
+        prior = progress.get(instrument_id)
+        record: dict[str, object]
+        if isinstance(prior, dict) and prior.get("status") in terminal_statuses:
+            # A resumed run must jump directly to the first pending catalog
+            # item.  Rebuilding and rewriting every prior record made the
+            # cursor appear stuck for minutes before any new request ran.
+            record = prior
+        elif item.get("isInternalInstrument") is True:
+            record = {
+                "instrument_id": instrument_id,
+                "symbol": symbol,
+                "display_name": _catalog_value(item, "instrumentDisplayName") or symbol,
+                "asset_class": normalized_class,
+                "status": "UNSUPPORTED_INTERNAL",
+                "reason": "PROVIDER_AUTHORITATIVE_IS_INTERNAL_INSTRUMENT_TRUE",
+                "updated_at": now.isoformat(),
+            }
+        elif normalized_class not in {"EQUITY", "ETF", "CRYPTO"}:
+            record = {
+                "instrument_id": instrument_id,
+                "symbol": symbol,
+                "display_name": _catalog_value(item, "instrumentDisplayName") or symbol,
+                "asset_class": normalized_class,
+                "status": "UNSUPPORTED",
+                "reason": "ASSET_CLASS_NOT_SUPPORTED_BY_ETORO_NATIVE_SCANNER",
+                "updated_at": now.isoformat(),
+            }
+        else:
+            instrument = _etoro_bootstrap_instrument(item, snapshot_id=snapshot_id, now=now)
+            reference = _etoro_bootstrap_reference(
+                item, snapshot_id=snapshot_id, asset_class=instrument.asset_class
+            )
+            timeframe_bars: dict[str, int] = {}
+            error: dict[str, object] | None = None
+            try:
+                for timeframe, interval in (
+                    (TimeFrame.ONE_HOUR, "OneHour"),
+                    (TimeFrame.ONE_DAY, "OneDay"),
+                ):
+                    raw = read_client.candle_history(
+                        instrument_id=int(instrument_id),
+                        direction="asc",
+                        interval=interval,
+                        candles_count=ETORO_UNIVERSE_BOOTSTRAP_BARS,
+                    )
+                    bars = tuple(
+                        bar
+                        for bar in _normalize_etoro_candles(
+                            raw, instrument=instrument, timeframe=timeframe
+                        )
+                        if bar.timestamp <= now
+                    )
+                    timeframe_bars[timeframe.value] = len(bars)
+                    if not bars:
+                        error = {"category": "NO_DATA", "timeframe": timeframe.value}
+                        break
+                    effective_cache.upsert_bars_with_stats(
+                        provider="etoro", bars=bars, fetched_at=now, mapping=reference
+                    )
+                if error is None:
+                    status = "BOOTSTRAPPED"
+                    reason = "VALID_ETORO_NATIVE_ONE_HOUR_AND_ONE_DAY_DATA"
+                elif error["category"] == "NO_DATA":
+                    status = "NO_DATA"
+                    reason = f"NO_DATA:{error['timeframe']}"
+                else:
+                    status = "ERROR_RETRYABLE"
+                    reason = "BOOTSTRAP_ERROR"
+            except EtoroApiError as exc:
+                metadata = exc.safe_metadata()
+                status = "ERROR_RETRYABLE"
+                reason = str(metadata.get("category", "ETORO_API_ERROR"))
+                error = {"category": reason, "status": metadata.get("http_status")}
+            except Exception as exc:
+                status = "ERROR_RETRYABLE"
+                reason = type(exc).__name__
+                error = {"category": type(exc).__name__}
+            record = {
+                "instrument_id": instrument_id,
+                "symbol": symbol,
+                "display_name": _catalog_value(item, "instrumentDisplayName") or symbol,
+                "asset_class": normalized_class,
+                "status": status,
+                "reason": reason,
+                "timeframes": timeframe_bars,
+                "error": error,
+                "updated_at": now.isoformat(),
+            }
+        progress[instrument_id] = record
+        if prior == record:
+            continue
+        progress_items = [progress[key] for key in sorted(progress)]
+        _atomic_json_write(
+            progress_path,
+            {
+                "schema_version": 1,
+                "source_snapshot_id": snapshot_id,
+                "source_snapshot_checksum_sha256": snapshot["snapshot_checksum_sha256"],
+                "source_endpoint": snapshot["source_endpoint"],
+                "required_timeframes": [TimeFrame.ONE_HOUR.value, TimeFrame.ONE_DAY.value],
+                "requested_bars_per_timeframe": ETORO_UNIVERSE_BOOTSTRAP_BARS,
+                "updated_at": now.isoformat(),
+                "records": progress_items,
+            },
+        )
+        _write_etoro_native_active_artifact(
+            snapshot=snapshot,
+            progress_records=progress_items,
+            artifact_path=artifact_path,
+            created_at=now,
+        )
+        if (index + 1) % batch_size == 0 and delay_seconds:
+            (sleeper or time.sleep)(delay_seconds)
+    artifact = _write_etoro_native_active_artifact(
+        snapshot=snapshot,
+        progress_records=progress_items,
+        artifact_path=artifact_path,
+        created_at=now,
+    )
+    status_counts = Counter(str(record["status"]) for record in progress_items)
+    return {
+        "status": "ETORO_UNIVERSE_BOOTSTRAP_COMPLETE",
+        "catalog_count": len(items),
+        "checked": len(progress_items),
+        "data_capable": status_counts.get("BOOTSTRAPPED", 0) + status_counts.get("DATA_CAPABLE", 0),
+        "bootstrapped": status_counts.get("BOOTSTRAPPED", 0),
+        "active_scanner_universe": len(cast(list[object], artifact["active_records"])),
+        "blocked": len(progress_items) - len(cast(list[object], artifact["active_records"])),
+        "status_counts": dict(sorted(status_counts.items())),
+        "progress_path": str(progress_path),
+        "active_universe_path": str(artifact_path),
+        "broker_write_calls": 0,
+        "demo_post_attempts": 0,
+        "real_execution_available": False,
+    }
+
+
+def build_etoro_crypto_validation_report(
+    config: ApplicationConfig,
+    *,
+    values: Mapping[str, str] | None = None,
+    client: EtoroReadClient | None = None,
+    cache: HistoricalDataCache | None = None,
+    snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+    report_path: Path = DEFAULT_ETORO_CRYPTO_VALIDATION_PATH,
+    clock: Callable[[], datetime] | None = None,
+    batch_size: int = 8,
+) -> dict[str, object]:
+    """Validate catalog crypto instruments with native eToro candles only."""
+    if batch_size <= 0:
+        raise ValueError("crypto validation batch size must be positive")
+    now = (clock or (lambda: datetime.now(UTC)))()
+    items = tuple(
+        item
+        for item in _validated_etoro_catalog_items(snapshot_path)
+        if _catalog_asset_class(item) == "CRYPTO" and item.get("isInternalInstrument") is not True
+    )
+    snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
+    assert snapshot is not None
+    progress: dict[str, dict[str, object]] = {}
+    if report_path.exists():
+        with report_path.open(encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if (
+            isinstance(existing, dict)
+            and existing.get("source_snapshot_id") == snapshot["snapshot_id"]
+        ):
+            rows = existing.get("records", [])
+            if isinstance(rows, list):
+                progress = {
+                    str(row["instrument_id"]): row
+                    for row in rows
+                    if isinstance(row, dict) and row.get("instrument_id") is not None
+                }
+    read_client = client
+    if read_client is None:
+        credentials = runtime_credentials(values)
+        if credentials is None:
+            return {
+                "status": "ETORO_CREDENTIALS_NOT_CONFIGURED",
+                "total_crypto_discovered": len(items),
+                "total_checked": 0,
+                "records": tuple(progress.values()),
+                "broker_write_calls": 0,
+                "real_execution_available": False,
+            }
+        if not config.etoro_api_enabled:
+            return {
+                "status": "ETORO_API_DISABLED",
+                "total_crypto_discovered": len(items),
+                "total_checked": 0,
+                "records": tuple(progress.values()),
+                "broker_write_calls": 0,
+                "real_execution_available": False,
+            }
+        read_client = EtoroReadClient(
+            credentials,
+            DisciplinedHttpClient(UrllibTransport(config.etoro_transport_mode)),
+        )
+    effective_cache = cache or HistoricalDataCache(DEFAULT_MARKET_DATA_CACHE_PATH)
+    checked_this_run = 0
+    for item in items:
+        instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
+        if progress.get(instrument_id, {}).get("status") == "ACTIVE_SCANNER_READY":
+            continue
+        if checked_this_run >= batch_size:
+            break
+        checked_this_run += 1
+        instrument = _etoro_bootstrap_instrument(
+            item, snapshot_id=str(snapshot["snapshot_id"]), now=now
+        )
+        mapping = _etoro_bootstrap_reference(
+            item, snapshot_id=str(snapshot["snapshot_id"]), asset_class=AssetClass.CRYPTO
+        )
+        row: dict[str, object] = {
+            "instrument_id": instrument_id,
+            "symbol": _catalog_value(item, "symbolFull"),
+            "display_name": _catalog_value(item, "instrumentDisplayName")
+            or _catalog_value(item, "symbolFull"),
+            "asset_class": "CRYPTO",
+            "status": "ERROR_RETRYABLE",
+            "reason": "UNVALIDATED",
+            "updated_at": now.isoformat(),
+        }
+        try:
+            raw_bars: dict[str, tuple[MarketBar, ...]] = {}
+            for timeframe, interval in (
+                (TimeFrame.ONE_HOUR, "OneHour"),
+                (TimeFrame.ONE_DAY, "OneDay"),
+            ):
+                raw = read_client.candle_history(
+                    instrument_id=int(instrument_id),
+                    direction="asc",
+                    interval=interval,
+                    candles_count=ETORO_UNIVERSE_BOOTSTRAP_BARS,
+                )
+                bars = tuple(
+                    bar
+                    for bar in _normalize_etoro_candles(
+                        raw, instrument=instrument, timeframe=timeframe
+                    )
+                    if bar.timestamp + (timedelta(hours=1) if timeframe is TimeFrame.ONE_HOUR else timedelta(days=1)) <= now
+                )
+                raw_bars[timeframe.value] = bars
+            one_hour = raw_bars[TimeFrame.ONE_HOUR.value]
+            one_day = raw_bars[TimeFrame.ONE_DAY.value]
+            all_bars = one_hour + one_day
+            duplicate_count = sum(
+                len(bars) - len({bar.timestamp for bar in bars}) for bars in (one_hour, one_day)
+            )
+            ohlcv_valid = all(
+                bar.high >= bar.low >= 0
+                and bar.open > 0
+                and bar.close > 0
+                and (bar.volume is None or bar.volume >= 0)
+                for bar in all_bars
+            )
+            freshness = classify_intraday_freshness(
+                instrument=instrument,
+                timeframe=TimeFrame.ONE_HOUR,
+                bars=one_hour,
+                as_of=now,
+                minimum_bars=ACTIVE_SCANNER_1H_MINIMUM_BARS,
+            )
+            causal = all(bar.timestamp <= now for bar in all_bars)
+            sufficient = len(one_hour) >= ACTIVE_SCANNER_1H_MINIMUM_BARS and len(one_day) >= 30
+            valid = bool(
+                one_hour
+                and one_day
+                and sufficient
+                and duplicate_count == 0
+                and ohlcv_valid
+                and causal
+            )
+            if valid:
+                effective_cache.upsert_bars_with_stats(
+                    provider="etoro", bars=all_bars, fetched_at=now, mapping=mapping
+                )
+            row.update(
+                {
+                    "status": "ACTIVE_SCANNER_READY" if valid else "REJECTED",
+                    "reason": "VALID_ETORO_NATIVE_CRYPTO_ONE_HOUR_AND_ONE_DAY_DATA"
+                    if valid
+                    else "INVALID_OR_INSUFFICIENT_CRYPTO_DATA",
+                    "reachable": True,
+                    "valid_candles": valid,
+                    "timeframes": {"1H": len(one_hour), "1D": len(one_day)},
+                    "freshness": freshness.value,
+                    "causal": causal,
+                    "sufficient_history": sufficient,
+                    "duplicate_timestamps": duplicate_count,
+                    "ohlcv_valid": ohlcv_valid,
+                }
+            )
+        except EtoroApiError as exc:
+            metadata = exc.safe_metadata()
+            row.update(
+                {
+                    "status": "REJECTED",
+                    "reason": str(metadata.get("category", "ETORO_API_ERROR")),
+                    "reachable": False,
+                    "valid_candles": False,
+                    "http_status": metadata.get("http_status"),
+                }
+            )
+        except Exception as exc:
+            row.update(
+                {"status": "ERROR_RETRYABLE", "reason": type(exc).__name__, "reachable": False}
+            )
+        progress[instrument_id] = row
+        _atomic_json_write(
+            report_path,
+            {
+                "schema_version": 1,
+                "source_snapshot_id": snapshot["snapshot_id"],
+                "source_snapshot_checksum_sha256": snapshot["snapshot_checksum_sha256"],
+                "source_endpoint": "/api/v1/market-data/instruments",
+                "required_timeframes": ["1H", "1D"],
+                "updated_at": now.isoformat(),
+                "records": [progress[key] for key in sorted(progress)],
+            },
+        )
+        if str(row.get("http_status")) == "429":
+            break
+    records = [progress[key] for key in sorted(progress)]
+    status_counts = Counter(str(row.get("status")) for row in records)
+    return {
+        "status": "CRYPTO_VALIDATION_PROBE_COMPLETE",
+        "total_crypto_discovered": len(items),
+        "total_checked": len(records),
+        "total_reachable": sum(bool(row.get("reachable")) for row in records),
+        "total_valid_candles": sum(bool(row.get("valid_candles")) for row in records),
+        "total_rejected": status_counts.get("REJECTED", 0),
+        "rejection_reason_counts": dict(
+            sorted(
+                Counter(
+                    str(row.get("reason")) for row in records if row.get("status") == "REJECTED"
+                ).items()
+            )
+        ),
+        "active_scanner_ready": status_counts.get("ACTIVE_SCANNER_READY", 0),
+        "newly_eligible": tuple(
+            {"instrument_id": row["instrument_id"], "symbol": row["symbol"]}
+            for row in records
+            if row.get("status") == "ACTIVE_SCANNER_READY"
+        ),
+        "report_path": str(report_path),
+        "broker_write_calls": 0,
+        "demo_post_attempts": 0,
+        "real_execution_available": False,
+    }
+
+
+def activate_validated_etoro_crypto(
+    *,
+    report_path: Path = DEFAULT_ETORO_CRYPTO_VALIDATION_PATH,
+    snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+    artifact_path: Path = DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH,
+) -> dict[str, object]:
+    """Merge validated native crypto without replacing the existing universe."""
+    items = _validated_etoro_catalog_items(snapshot_path)
+    snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
+    artifact = read_etoro_dynamic_universe_artifact(artifact_path)
+    with report_path.open(encoding="utf-8") as handle:
+        report = json.load(handle)
+    if not snapshot or not artifact or artifact.get("universe_source") != "etoro-native-bootstrap":
+        raise ValueError("Native universe required for crypto activation")
+    if any(source.get("source_snapshot_id") != snapshot["snapshot_id"] for source in (report, artifact)):
+        raise ValueError("Crypto activation snapshot mismatch")
+    catalog = {_catalog_value(item, "instrumentID", "instrumentId"): item for item in items}
+    records = {str(row["instrument_id"]): dict(row) for row in artifact["records"]}
+    activated = []
+    for row in report.get("records", []):
+        if row.get("status") != "ACTIVE_SCANNER_READY":
+            continue
+        identifier = str(row["instrument_id"])
+        item = catalog.get(identifier, {})
+        frames = row.get("timeframes", {})
+        if (_catalog_asset_class(item) != "CRYPTO" or item.get("isInternalInstrument") is True
+            or _catalog_value(item, "symbolFull") != row.get("symbol")
+            or not all(row.get(key) is True for key in ("valid_candles", "causal", "sufficient_history", "ohlcv_valid"))
+            or row.get("duplicate_timestamps") != 0
+            or frames.get("1H", 0) < ACTIVE_SCANNER_1H_MINIMUM_BARS or frames.get("1D", 0) < 30):
+            raise ValueError("Invalid crypto activation evidence")
+        records[identifier] = {**row, "status": "BOOTSTRAPPED"}
+        activated.append(row["symbol"])
+    if not activated:
+        raise ValueError("No validated crypto to activate")
+    result = _write_etoro_native_active_artifact(
+        snapshot=snapshot, progress_records=list(records.values()),
+        artifact_path=artifact_path, created_at=datetime.now(UTC),
+    )
+    return {"activated_crypto": activated, "runtime_universe_count": len(result["active_records"]),
+            "broker_write_calls": 0}
+
+
+def build_etoro_dynamic_active_universe(
+    *,
+    cache: HistoricalDataCache | None = None,
+    snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+    artifact_path: Path = DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH,
+    created_at: datetime | None = None,
+) -> dict[str, object]:
+    """Derive a broker-aware active-universe artifact from local evidence only."""
+    snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
+    if snapshot is None:
+        raise ValueError("UNIVERSE_SNAPSHOT_INVALID: snapshot is absent")
+    raw = snapshot.get("raw_response")
+    items = _catalog_items(raw)
+    checksum = hashlib.sha256(
+        json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    if (
+        checksum != snapshot.get("snapshot_checksum_sha256")
+        or snapshot.get("raw_count") != len(items)
+        or snapshot.get("unique_instrument_id_count")
+        != len({_catalog_value(item, "instrumentID", "instrumentId") for item in items})
+        or snapshot.get("duplicate_instrument_id_count")
+        != len(items)
+        - len({_catalog_value(item, "instrumentID", "instrumentId") for item in items})
+    ):
+        raise ValueError("UNIVERSE_SNAPSHOT_INVALID: checksum or counts do not match")
+    if any(not _catalog_value(item, "instrumentID", "instrumentId") for item in items):
+        raise ValueError("UNIVERSE_SNAPSHOT_INVALID: missing instrument ID")
+
+    effective_cache = cache or HistoricalDataCache(DEFAULT_MARKET_DATA_CACHE_PATH)
+    references_by_symbol: dict[str, list[ProviderInstrumentReference]] = defaultdict(list)
+    for reference in effective_cache.mapping_references(provider="alpaca"):
+        if reference.verified:
+            references_by_symbol[reference.broker_symbol.upper()].append(reference)
+
+    records: list[dict[str, object]] = []
+    active: list[dict[str, object]] = []
+    for item in items:
+        symbol = _catalog_value(item, "symbolFull").upper()
+        instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
+        normalized_class = _catalog_asset_class(item)
+        matching_by_id = {
+            reference.broker_instrument_id: reference
+            for reference in references_by_symbol.get(symbol, [])
+            if reference.asset_class.value == normalized_class
+            and not reference.broker_instrument_id.startswith("ALPACA_ONLY:")
+        }
+        matching = list(matching_by_id.values())
+        if normalized_class not in {"EQUITY", "ETF", "CRYPTO"}:
+            mapping_status = "UNSUPPORTED"
+            coverage_status = "UNSUPPORTED_ASSET_CLASS"
+            universe_state = "UNSUPPORTED_ASSET_CLASS"
+            reason = "ASSET_CLASS_NOT_SUPPORTED_BY_CURRENT_SCANNER_DATA_STACK"
+        elif len(matching) != 1:
+            mapping_status = "AMBIGUOUS" if matching else "UNMAPPED"
+            coverage_status = "MARKET_DATA_MAPPING_REQUIRED"
+            universe_state = "PROVIDER_MAPPING_REQUIRED"
+            reason = (
+                "AMBIGUOUS_PROVIDER_MAPPING"
+                if matching
+                else "NO_VERIFIED_ALPACA_MAPPING_WITH_COMPATIBLE_ASSET_CLASS"
+            )
+        else:
+            reference = matching[0]
+            one_day = effective_cache.coverage_summary(
+                provider="alpaca",
+                broker=reference.broker,
+                broker_instrument_id=reference.broker_instrument_id,
+                timeframe=TimeFrame.ONE_DAY,
+                start=datetime(2000, 1, 1, tzinfo=UTC),
+                end=datetime(2100, 1, 1, tzinfo=UTC),
+            )
+            one_hour = effective_cache.coverage_summary(
+                provider="alpaca",
+                broker=reference.broker,
+                broker_instrument_id=reference.broker_instrument_id,
+                timeframe=TimeFrame.ONE_HOUR,
+                start=datetime(2000, 1, 1, tzinfo=UTC),
+                end=datetime(2100, 1, 1, tzinfo=UTC),
+            )
+            if (
+                int(str(one_day["count"])) > 0
+                and int(str(one_hour["count"])) >= ACTIVE_SCANNER_1H_MINIMUM_BARS
+            ):
+                mapping_status = "VERIFIED"
+                coverage_status = "MARKET_DATA_READY"
+                universe_state = "ACTIVE_SCANNER_READY"
+                reason = "VERIFIED_ALPACA_1D_AND_1H_CAUSAL_COVERAGE"
+            else:
+                mapping_status = "VERIFIED"
+                coverage_status = "BOOTSTRAP_REQUIRED"
+                universe_state = "BOOTSTRAP_REQUIRED"
+                reason = "INSUFFICIENT_CACHED_1D_OR_1H_CONTEXT"
+
+        record = {
+            "etoro_instrument_id": instrument_id,
+            "symbol": symbol,
+            "display_name": _catalog_value(item, "instrumentDisplayName") or None,
+            "instrument_type_id": _catalog_value(item, "instrumentTypeID"),
+            "normalized_asset_class": normalized_class,
+            "exchange_id": _catalog_value(item, "exchangeID") or None,
+            "mapping_status": mapping_status,
+            "coverage_status": coverage_status,
+            "universe_state": universe_state,
+            "inclusion_reason": reason,
+            "source_snapshot_id": snapshot["snapshot_id"],
+        }
+        if len(matching) == 1 and mapping_status == "VERIFIED":
+            reference = matching[0]
+            record.update(
+                {
+                    "market_data_provider": reference.provider,
+                    "provider_symbol": reference.provider_symbol,
+                    "provider_instrument_id": reference.broker_instrument_id,
+                    "mapping_source": reference.mapping_source,
+                }
+            )
+        records.append(record)
+        if coverage_status == "MARKET_DATA_READY" and mapping_status == "VERIFIED":
+            active.append(record)
+
+    normalized_counts = Counter(str(item["normalized_asset_class"]) for item in records)
+    state_counts = Counter(str(item["universe_state"]) for item in records)
+    blocked_reasons = Counter(
+        str(item["coverage_status"]) for item in records if item not in active
+    )
+    artifact = {
+        "schema_version": 1,
+        "created_at": (created_at or datetime.now(UTC)).isoformat(),
+        "source_snapshot_id": snapshot["snapshot_id"],
+        "source_snapshot_checksum_sha256": snapshot["snapshot_checksum_sha256"],
+        "catalog_instrument_count": len(items),
+        "verified_mapping_count": sum(item["mapping_status"] == "VERIFIED" for item in records),
+        "market_data_ready_count": len(active),
+        "blocked_count": len(records) - len(active),
+        "normalized_asset_class_counts": dict(sorted(normalized_counts.items())),
+        "blocked_reasons": dict(sorted(blocked_reasons.items())),
+        "universe_state_counts": dict(sorted(state_counts.items())),
+        "records": records,
+        "active_records": active,
+    }
+    assert_secret_free(artifact)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=artifact_path.parent,
+            prefix=f".{artifact_path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            json.dump(artifact, temporary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, artifact_path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return artifact
+
+
+def load_etoro_dynamic_active_scanner_instruments(
+    *, artifact_path: Path = DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH
+) -> tuple[UniversalInstrument, ...]:
+    """Load only records proven ready by the local derived universe artifact."""
+    artifact = read_etoro_dynamic_universe_artifact(artifact_path)
+    if artifact is None:
+        raise ValueError("UNIVERSE_MARKET_DATA_NOT_READY: active artifact is absent")
+    active_records = artifact.get("active_records")
+    if not isinstance(active_records, list):
+        raise ValueError("UNIVERSE_SNAPSHOT_INVALID: active artifact is malformed")
+    catalog = read_etoro_instrument_catalog_snapshot()
+    catalog_by_id = (
+        {
+            _catalog_value(item, "instrumentID", "instrumentId"): item
+            for item in _catalog_items(catalog.get("raw_response"))
+        }
+        if catalog is not None
+        else {}
+    )
+    instruments: list[UniversalInstrument] = []
+    for record in active_records:
+        if not isinstance(record, dict):
+            raise ValueError("UNIVERSE_SNAPSHOT_INVALID: active record is malformed")
+        catalog_item = catalog_by_id.get(str(record["etoro_instrument_id"]), {})
+        exchange = _catalog_value(catalog_item, "exchangeID", "exchangeId") or None
+        internal_tag = (
+            ("unsupported-internal",) if catalog_item.get("isInternalInstrument") is True else ()
+        )
+        instruments.append(
+            UniversalInstrument(
+                broker=str(record["market_data_provider"]),
+                broker_instrument_id=str(record["provider_instrument_id"]),
+                symbol=str(record["symbol"]),
+                display_name=str(record["display_name"] or record["symbol"]),
+                asset_class=AssetClass(str(record["normalized_asset_class"])),
+                currency=Currency.USD,
+                exchange=exchange,
+                market_status=(
+                    MarketStatus.CONTINUOUS_24_7
+                    if record["normalized_asset_class"] == "CRYPTO"
+                    else MarketStatus.UNKNOWN
+                ),
+                tradeable=None,
+                buy_allowed=None,
+                sell_allowed=None,
+                short_allowed=False,
+                leverage_available=False,
+                max_leverage=Decimal("1"),
+                settlement_type=SettlementType.REAL,
+                minimum_order_value=Decimal("1"),
+                fractional_supported=True,
+                metadata_timestamp=datetime.fromisoformat(str(artifact["created_at"])),
+                tags=(
+                    (
+                        "etoro-native-bootstrap"
+                        if artifact.get("universe_source") == "etoro-native-bootstrap"
+                        else "dynamic-etoro-universe"
+                    ),
+                    f"etoro-instrument-id:{record['etoro_instrument_id']}",
+                    f"catalog-snapshot:{artifact['source_snapshot_id']}",
+                    *internal_tag,
+                ),
+            )
+        )
+    return tuple(instruments)
+
+
+def read_etoro_dynamic_universe_artifact(
+    artifact_path: Path = DEFAULT_ETORO_ACTIVE_UNIVERSE_PATH,
+) -> dict[str, object] | None:
+    if not artifact_path.exists():
+        return None
+    with artifact_path.open(encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    if not isinstance(artifact, dict):
+        raise ValueError("UNIVERSE_SNAPSHOT_INVALID: active artifact is malformed")
+    return artifact
+
+
+def catalog_session_exclusion_reason(item: dict[str, object]) -> str | None:
+    """Shared static eligibility for the full-catalog session audit and lookup."""
+    if item.get("isInternalInstrument") is True:
+        return "UNSUPPORTED_INTERNAL_INSTRUMENT"
+    if item.get("isActiveInPlatform") is False:
+        return "INACTIVE_INSTRUMENT"
+    if item.get("isDelisted") is True:
+        return "DELISTED_INSTRUMENT"
+    if item.get("isHiddenFromClient") is True:
+        return "HIDDEN_INSTRUMENT"
+    if _catalog_asset_class(item) not in {"EQUITY", "ETF", "CRYPTO"}:
+        return "ASSET_CLASS_NOT_SUPPORTED_BY_CURRENT_SESSION_ENRICHMENT"
+    return None
+
+
+def _catalog_asset_class(item: dict[str, object]) -> str:
+    """Map provider instrument type IDs using explicit catalog evidence."""
+    type_id = item.get("instrumentTypeID", item.get("instrumentTypeId"))
+    if not isinstance(type_id, int):
+        return "OTHER"
+    return {
+        1: "FOREX",
+        4: "INDEX",
+        5: "EQUITY",
+        6: "ETF",
+        10: "CRYPTO",
+    }.get(type_id, "OTHER")
+
+
+def _catalog_items(raw: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(raw, dict):
+        return ()
+    for key in ("instrumentDisplayDatas", "instrumentDisplayData", "items", "instruments"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return tuple(item for item in value if isinstance(item, dict))
+    return ()
+
+
+def _catalog_value(item: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _catalog_distribution(values: tuple[str, ...]) -> dict[str, int]:
+    return {value: values.count(value) for value in sorted(set(values)) if value}
+
+
+def _etoro_discovery_row(instrument: UniversalInstrument) -> dict[str, object]:
+    metadata = {
+        "instrument_id": instrument.broker_instrument_id,
+        "symbol": instrument.symbol,
+        "display_name": instrument.display_name,
+        "asset_class": instrument.asset_class.value,
+        "currency": None if instrument.currency is None else instrument.currency.value,
+        "exchange": instrument.exchange,
+        "market": instrument.market,
+        "market_status": instrument.market_status.value,
+        "tradeable": instrument.tradeable,
+        "buy_allowed": instrument.buy_allowed,
+        "sell_allowed": instrument.sell_allowed,
+        "short_allowed": instrument.short_allowed,
+        "fractional_supported": instrument.fractional_supported,
+        "minimum_order_value": (
+            None if instrument.minimum_order_value is None else str(instrument.minimum_order_value)
+        ),
+        "minimum_quantity": (
+            None if instrument.minimum_quantity is None else str(instrument.minimum_quantity)
+        ),
+        "last_price": None if instrument.last_price is None else str(instrument.last_price),
+        "metadata_timestamp": instrument.metadata_timestamp.isoformat(),
+        "provider": "etoro",
+        "mapping_source": "official eToro instrumentId + search metadata",
+    }
+    supported = instrument.asset_class in {
+        AssetClass.EQUITY,
+        AssetClass.ETF,
+        AssetClass.CRYPTO,
+    }
+    return {
+        "instrument": metadata,
+        "mapping_status": "VERIFIED"
+        if instrument.numeric_instrument_id is not None
+        else "UNMAPPED",
+        "market_data_status": "MARKET_DATA_READY" if supported else "UNSUPPORTED_ASSET_CLASS",
     }
 
 
@@ -2114,14 +3400,58 @@ def build_readonly_active_scan_cycle_report(
         cash=Decimal("200"),
     )
     scanner = ActiveMarketScanner(minimum_bars=ACTIVE_SCANNER_1H_MINIMUM_BARS)
-    result = scanner.scan(
+    audit_store = (
+        default_active_intelligence_audit_store()
+        if cache is None
+        else ActiveIntelligenceAuditStore(SqliteRecordStore(Path(":memory:")))
+    )
+    orchestrator = AegisActiveIntelligenceOrchestrator(
+        scanner=scanner,
+        audit_store=audit_store,
+    )
+    cycle = orchestrator.run_if_new_bar_cycle(
+        scheduled_at=scan_cycle_timestamp,
         instruments=instruments,
         bars_by_symbol=bars_by_symbol,
         portfolio=portfolio,
-        as_of=scan_cycle_timestamp,
         timeframe=TimeFrame.ONE_HOUR,
-        simulated_capital=Decimal("200"),
+        shadow_capital=Decimal("200"),
     )
+    if cycle is None:
+        persisted = audit_store.cycles()
+        last = persisted[-1] if persisted else {}
+        last_scanner = last.get("scanner_result", {})
+        candidate_rows = (
+            last_scanner.get("candidates", ()) if isinstance(last_scanner, dict) else ()
+        )
+        candidate_count = len(candidate_rows) if isinstance(candidate_rows, (list, tuple)) else 0
+        return {
+            "status": "NO_CYCLE",
+            "phase": "STEP_9_0A4_READ_ONLY_ACTIVE_SCAN_CYCLE",
+            "execution_mode": "READ_ONLY",
+            "scanner_cycle_status": "NO_CYCLE",
+            "scan_cycle_timestamp": (
+                persisted[-1].get("scan_cycle_timestamp") if persisted else None
+            ),
+            "universe_scanned": tuple(instrument.symbol for instrument in instruments),
+            "assets_requested": len(instruments),
+            "assets_comparable": candidate_count,
+            "assets_excluded": max(0, len(instruments) - candidate_count),
+            "top_opportunities": last.get("top_opportunities", ()),
+            "watchlist": last.get("watchlist", ()),
+            "no_trade": last.get("no_trade", ()),
+            "rejected": last.get("rejected", ()),
+            "positions_to_manage": (),
+            "broker_write_calls": 0,
+            "demo_execution_enabled": config.etoro_demo_execution_enabled,
+            "real_execution_available": False,
+            "critical_blockers": (),
+            "no_cycle_reason": "NO_NEW_CAUSALLY_COMPLETED_1H_BAR",
+            "last_successful_cycle": last or None,
+        }
+    if orchestrator.last_scanner_result is None:
+        raise RuntimeError("accepted cycle has no scanner result")
+    result = orchestrator.last_scanner_result
     snapshot = scanner.build_observation_snapshot(
         instruments=instruments,
         bars_by_symbol=bars_by_symbol,
@@ -2129,6 +3459,7 @@ def build_readonly_active_scan_cycle_report(
         scan_cycle_timestamp=scan_cycle_timestamp,
         timeframe=TimeFrame.ONE_HOUR,
         simulated_capital=Decimal("200"),
+        precomputed_result=result,
     )
     observations = tuple(snapshot.entry_candidates) + tuple(snapshot.entry_exclusions)
     observation_by_symbol = {item.symbol: item for item in observations}
@@ -2151,6 +3482,13 @@ def build_readonly_active_scan_cycle_report(
     return {
         "status": "READ_ONLY_ACTIVE_SCAN_CYCLE_READY" if not blockers else "BLOCKED",
         "phase": "STEP_9_0A4_READ_ONLY_ACTIVE_SCAN_CYCLE",
+        "execution_mode": "READ_ONLY",
+        "capital_currency": portfolio.currency.value,
+        "capital_mode": "SIMULATED",
+        "data_readiness": (
+            "READY" if len(snapshot.entry_candidates) == len(instruments) else "DEGRADED"
+        ),
+        "scanner_cycle_status": "COMPLETE" if not blockers else "BLOCKED",
         "scan_cycle_timestamp": scan_cycle_timestamp.isoformat(),
         "universe_scanned": tuple(instrument.symbol for instrument in instruments),
         "assets_requested": len(instruments),

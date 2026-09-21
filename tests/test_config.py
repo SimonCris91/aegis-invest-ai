@@ -7,7 +7,13 @@ from pydantic import ValidationError
 
 from app.config.loader import ConfigLoadError, load_config, load_runtime_values
 from app.config.models import ApplicationConfig, RiskPolicyConfig, TargetAllocations
-from app.domain.enums import BrokerProviderMode, Environment, EtoroTransportMode
+from app.domain.enums import (
+    BrokerProviderMode,
+    Environment,
+    EtoroTransportMode,
+    OperatingMode,
+    ProviderMode,
+)
 
 
 def test_default_config_is_demo_and_fail_closed() -> None:
@@ -77,6 +83,47 @@ def test_provider_defaults_are_offline_and_brokerless() -> None:
     assert config.strategy.confidence_profile == "V1_LEGACY"
 
 
+@pytest.mark.parametrize(
+    ("raw_provider", "expected"),
+    (
+        (None, ProviderMode.FIXTURE),
+        ("alpha_vantage", ProviderMode.ALPHA_VANTAGE),
+        ("none", ProviderMode.NONE),
+    ),
+)
+def test_news_provider_selection_is_explicit_and_defaults_to_fixture(
+    raw_provider: str | None, expected: ProviderMode
+) -> None:
+    values = {} if raw_provider is None else {"AEGIS_NEWS_PROVIDER": raw_provider}
+    assert load_config(values).providers.news is expected
+
+
+def test_dotenv_news_provider_reaches_config_without_exposing_secrets(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "AEGIS_NEWS_PROVIDER=alpha_vantage\nALPHA_VANTAGE_API_KEY=synthetic-secret\n",
+        encoding="utf-8",
+    )
+
+    runtime_values = load_runtime_values(values={}, env_file=env_file)
+    config = load_config(runtime_values)
+
+    assert config.providers.news is ProviderMode.ALPHA_VANTAGE
+    assert runtime_values["ALPHA_VANTAGE_API_KEY"] == "synthetic-secret"
+
+
+def test_authorized_capital_is_optional_and_strictly_loaded() -> None:
+    assert load_config({}).authorized_capital_eur is None
+    assert load_config({"AEGIS_AUTHORIZED_CAPITAL_EUR": "2000"}).authorized_capital_eur == Decimal(
+        "2000"
+    )
+
+    with pytest.raises(ConfigLoadError, match="positive decimal"):
+        load_config({"AEGIS_AUTHORIZED_CAPITAL_EUR": "0"})
+    with pytest.raises(ConfigLoadError, match="positive decimal"):
+        load_config({"AEGIS_AUTHORIZED_CAPITAL_EUR": "not-a-number"})
+
+
 def test_confidence_profile_is_explicit_and_reversible() -> None:
     absent = load_config({})
     legacy = load_config({"AEGIS_CONFIDENCE_PROFILE": "V1_LEGACY"})
@@ -94,6 +141,31 @@ def test_confidence_profile_is_explicit_and_reversible() -> None:
 def test_unknown_confidence_profile_fails_closed() -> None:
     with pytest.raises(ConfigLoadError, match="confidence profile"):
         load_config({"AEGIS_CONFIDENCE_PROFILE": "V2_B_AUTO"})
+
+
+def test_automatic_demo_pilot_is_off_by_default_and_requires_demo_execution() -> None:
+    assert load_config({}).etoro_demo_automatic_pilot_enabled is False
+
+    with pytest.raises(ConfigLoadError, match="Demo execution"):
+        load_config(
+            {
+                "AEGIS_OPERATING_MODE": "ETORO_DEMO",
+                "ETORO_API_ENABLED": "true",
+                "AEGIS_ETORO_DEMO_AUTOMATIC_PILOT_ENABLED": "true",
+            }
+        )
+
+    config = load_config(
+        {
+            "AEGIS_OPERATING_MODE": OperatingMode.ETORO_DEMO.value,
+            "ETORO_API_ENABLED": "true",
+            "ETORO_DEMO_EXECUTION_ENABLED": "true",
+            "AEGIS_ETORO_DEMO_AUTOMATIC_PILOT_ENABLED": "true",
+        }
+    )
+
+    assert config.etoro_demo_automatic_pilot_enabled is True
+    assert config.etoro_demo_execution_enabled is True
 
 
 def test_etoro_read_selection_must_be_explicit_and_consistent() -> None:

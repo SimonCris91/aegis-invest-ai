@@ -68,8 +68,11 @@ class InstrumentResolution(FrozenDomainModel):
     classification_evidence_source: str = "search"
     classification_status: str = "UNCLASSIFIED"
     market_status: MarketStatus
+    is_exchange_open: bool | None = None
+    is_open: bool | None = None
     is_currently_tradable: bool | None
     is_buy_enabled: bool | None
+    is_internal_instrument: bool | None = None
     is_hidden_from_client: bool | None
     is_delisted: bool | None
     is_active_in_platform: bool | None

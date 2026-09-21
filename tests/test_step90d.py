@@ -149,6 +149,29 @@ def test_alpha_vantage_rate_limit_and_auth_fail_closed_with_secret_safe_diagnost
     assert missing_exc.value.status is NewsProviderStatus.AUTH_FAILED
 
 
+def test_alpha_vantage_provider_rate_message_with_echoed_key_is_rate_limited_and_redacted() -> None:
+    echoed_key = "secret"
+    provider = AlphaVantageNewsProvider(
+        api_key=echoed_key,
+        transport=_JsonTransport(
+            {
+                "Information": (
+                    f"We have detected your API key as {echoed_key} and our standard "
+                    "API rate limit is 25 requests per day."
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(NewsProviderError) as exc_info:
+        provider.fetch_global_news(as_of=datetime(2026, 8, 28, tzinfo=UTC))
+
+    assert exc_info.value.status is NewsProviderStatus.RATE_LIMITED
+    diagnostics = exc_info.value.safe_diagnostics()
+    assert echoed_key not in str(diagnostics)
+    assert "<redacted>" in str(diagnostics)
+
+
 def test_alpha_vantage_malformed_response_fails_closed() -> None:
     provider = AlphaVantageNewsProvider(api_key="secret", transport=_JsonTransport({"feed": {}}))
 

@@ -406,12 +406,34 @@ def test_read_client_resolves_instrument_with_documented_search_query(now: datet
         "isExchangeOpen",
         "isCurrentlyTradable",
         "isBuyEnabled",
+        "isInternalInstrument",
         "isHiddenFromClient",
         "isDelisted",
         "isActiveInPlatform",
         "currentRate",
     ]
     assert "internalSymbolFull=TEST" in transport.calls[0][1]
+
+
+def test_read_client_resolves_session_metadata_by_authoritative_instrument_id(
+    now: datetime,
+) -> None:
+    transport = SequencedTransport(
+        [
+            HttpResponse(
+                200, {}, _bytes(_search_payload(symbol="OTHER", instrument_id=TEST_INSTRUMENT_ID))
+            )
+        ]
+    )
+
+    resolution = _client(transport).resolve_instrument_id(
+        TEST_INSTRUMENT_ID, symbol="EXPECTED", as_of=now
+    )
+
+    assert resolution.instrument_id == TEST_INSTRUMENT_ID
+    assert resolution.internal_symbol_full == "OTHER"
+    assert f"instrumentId={TEST_INSTRUMENT_ID}" in transport.calls[0][1]
+    assert "internalSymbolFull" not in parse_qs(urlparse(transport.calls[0][1]).query)
 
 
 def test_read_client_raw_search_and_metadata_reads_are_read_only() -> None:
@@ -475,6 +497,20 @@ def test_read_client_metadata_extractors_tolerate_unexpected_payloads() -> None:
 
     assert client.instrument_metadata((1001,)) == {}
     assert client.instrument_type_names() == {}
+
+
+def test_read_client_can_fetch_unfiltered_instrument_display_catalog() -> None:
+    transport = SequencedTransport(
+        [HttpResponse(200, {}, _bytes({"instrumentDisplayDatas": [{"instrumentID": 1001}]}))]
+    )
+    client = _client(transport)
+
+    payload = client.instrument_display_data()
+
+    assert payload == {"instrumentDisplayDatas": [{"instrumentID": 1001}]}
+    assert transport.calls[0][0] == "GET"
+    assert transport.calls[0][1] == BASE + INSTRUMENTS_PATH
+    assert all(call[3] is None for call in transport.calls)
 
 
 def test_readiness_report_fails_closed_without_credentials_and_cli_is_secret_free(

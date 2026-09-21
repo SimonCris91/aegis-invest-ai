@@ -1,6 +1,7 @@
 """Risk inputs, deterministic decisions, and cryptographically sealed authorization."""
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import Field, field_validator, model_validator
@@ -9,6 +10,24 @@ from app.domain.base import FrozenDomainModel, require_aware
 from app.domain.enums import RiskDecisionStatus, RiskViolationCode
 from app.domain.market import InstrumentMetadata, PriceSnapshot
 from app.domain.portfolio import PortfolioSnapshot
+from app.domain.proposals import TradeProposal
+
+
+class AuthorizedCapitalEnvelope(FrozenDomainModel):
+    """User permission boundary, distinct from broker account capacity."""
+
+    authorized_capital_eur: Decimal = Field(gt=0)
+    managed_exposure_eur: Decimal | None = Field(default=None, ge=0)
+    reserved_capital_eur: Decimal = Field(default=Decimal("0"), ge=0)
+
+    @property
+    def remaining_authorized_capital_eur(self) -> Decimal | None:
+        if self.managed_exposure_eur is None:
+            return None
+        remaining = (
+            self.authorized_capital_eur - self.managed_exposure_eur - self.reserved_capital_eur
+        )
+        return max(Decimal("0"), remaining)
 
 
 class RiskViolation(FrozenDomainModel):
@@ -72,6 +91,7 @@ class RiskContext(FrozenDomainModel):
     recent_idempotency_keys: frozenset[str] = frozenset()
     api_state_consistent: bool = True
     critical_operational_error: str | None = None
+    capital_envelope: AuthorizedCapitalEnvelope | None = None
 
     @field_validator("evaluated_at")
     @classmethod
@@ -83,6 +103,8 @@ class RiskEvaluation(FrozenDomainModel):
     decision: RiskDecision
     authorization: RiskAuthorization | None = None
     authorization_deferred: bool = False
+    approved_notional_eur: Decimal | None = Field(default=None, gt=0)
+    approved_proposal: TradeProposal | None = None
 
     @model_validator(mode="after")
     def authorization_matches_status(self) -> "RiskEvaluation":
