@@ -39,12 +39,14 @@ powershell -ExecutionPolicy Bypass -File .\initialize-secondary-news-relay.ps1
 ```
 
 Copia il file generato in `C:\AEGIS-Secondary\relay-key.txt` sul secondo PC.
-Avvia poi il motore indicando il tunnel HTTPS corrente:
+Il relay usa il sottodominio stabile `relay.aquariusageai.com`; non serve più
+indicare un hostname temporaneo Cloudflare:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start-aegis-secondary.ps1 -RelayUrl https://ORIGINE-TUNNEL/api/secondary/news
+powershell -ExecutionPolicy Bypass -File .\start-aegis-secondary.ps1
 ```
 
 La chiave deve essere presente anche nel processo principale. Il relay resta
 shadow-only: il principale riutilizza l’evidenza solo dentro i controlli news
-e RiskManager.
+e RiskManager. Un `401` anonimo su GET non è una prova sufficiente del relay:
+la verifica reale è un POST firmato dalla chiave relay.

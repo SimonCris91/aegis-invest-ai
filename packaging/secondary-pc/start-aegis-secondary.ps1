@@ -1,6 +1,6 @@
 param(
     [string]$InstallRoot = "C:\AEGIS-Secondary",
-    [string]$RelayUrl = ""
+    [string]$RelayUrl = "https://relay.aquariusageai.com/api/secondary/news"
 )
 
 $ErrorActionPreference = "Stop"

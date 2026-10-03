@@ -208,7 +208,11 @@ def publish(cycle: Any, values: Mapping[str, str], *, now: datetime | None = Non
         request = Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "X-Aegis-News-Relay-Signature": envelope["signature"]},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AEGIS-Secondary-News-Relay/1",
+                "X-Aegis-News-Relay-Signature": envelope["signature"],
+            },
             method="POST",
         )
         with build_opener(_NoRedirect()).open(request, timeout=15) as response:
