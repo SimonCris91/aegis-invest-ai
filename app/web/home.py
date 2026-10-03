@@ -14,6 +14,7 @@ class WatchlistAsset(BaseModel):
 
     symbol: str
     name: str
+    description: str | None = None
     asset_class: str | None = None
     score: Decimal | None = None
     confidence: Decimal | None = None
@@ -37,6 +38,7 @@ class PositionSummary(BaseModel):
 
     symbol: str
     name: str
+    description: str | None = None
     asset_class: str | None = None
     value: Decimal | None = None
     score: Decimal | None = None
@@ -76,6 +78,8 @@ class ScannerSnapshot(BaseModel):
     catalog_ready_count: int | None = Field(default=None, ge=0)
     catalog_blocked_count: int | None = Field(default=None, ge=0)
     catalog_pending_count: int | None = Field(default=None, ge=0)
+    catalog_as_of: datetime | None = None
+    bootstrap_as_of: datetime | None = None
     universe_count: int | None = Field(default=None, ge=0)
     coherent_now: int | None = Field(default=None, ge=0)
     top_opportunities: int | None = Field(default=None, ge=0)
@@ -124,6 +128,7 @@ class AegisHomeSnapshot(BaseModel):
     data_health: DataHealthSnapshot
     news: dict[str, object] = Field(default_factory=dict)
     live_system_status: dict[str, object] | None = None
+    benchmark: dict[str, object] = Field(default_factory=dict)
 
 
 RUNNER_HEARTBEAT_STALE_AFTER_SECONDS = 180
@@ -210,11 +215,19 @@ def home_snapshot_from_scan_cycle(
         as_of=as_of,
         capital=CapitalSnapshot(
             amount=(
-                _optional_decimal(live_capital.get("authorized_capital_eur"))
+                _optional_decimal(live_capital.get("authorized_capital"))
+                if live_capital.get("authorized_capital") is not None
+                else _optional_decimal(live_capital.get("authorized_capital_eur"))
                 if "authorized_capital_eur" in live_capital
                 else _optional_decimal(scanner_output.get("simulated_capital"))
             ),
-            currency=_optional_string(report.get("capital_currency")),
+            currency=(
+                _optional_string(live_capital.get("currency"))
+                if live_capital.get("authorized_capital") is not None
+                else "EUR"
+                if "authorized_capital_eur" in live_capital
+                else _optional_string(report.get("capital_currency"))
+            ),
             mode=_capital_mode(report.get("capital_mode")),
         ),
         scanner=ScannerSnapshot(
@@ -229,6 +242,8 @@ def home_snapshot_from_scan_cycle(
             catalog_ready_count=_optional_int(live_universe.get("catalog_market_data_ready_count")),
             catalog_blocked_count=_optional_int(live_universe.get("catalog_blocked_count")),
             catalog_pending_count=_optional_int(live_universe.get("catalog_pending_count")),
+            catalog_as_of=_parse_optional_datetime(live_universe.get("catalog_as_of")),
+            bootstrap_as_of=_parse_optional_datetime(live_universe.get("bootstrap_as_of")),
             universe_count=live_active_count,
             coherent_now=_optional_int(live_acquisition.get("eligible_count")),
             top_opportunities=(
@@ -258,6 +273,9 @@ def home_snapshot_from_scan_cycle(
             WatchlistAsset(
                 symbol=str(row.get("symbol", "")),
                 name=str(row.get("full_asset_name", row.get("symbol", ""))),
+                description=_optional_string(
+                    row.get("description", row.get("full_asset_name", row.get("symbol")))
+                ),
                 asset_class=_optional_string(row.get("asset_class")),
                 score=_optional_decimal(row.get("opportunity_score")),
                 confidence=_optional_decimal(row.get("confidence")),
@@ -268,7 +286,7 @@ def home_snapshot_from_scan_cycle(
                 data_quality=_optional_string(row.get("data_quality", row.get("data_quality_state"))),
                 freshness=_optional_string(row.get("freshness", row.get("freshness_state"))),
                 provider_provenance=_strings(row.get("provider_provenance")),
-                reasons=_strings(row.get("rejection_reasons")),
+                reasons=_strings(row.get("reasons", row.get("rejection_reasons"))),
                 risk_flags=_strings(row.get("risk_flags")),
                 news_sentiment=_optional_string(row.get("news_sentiment")),
                 material_event_count=_optional_int(row.get("material_event_count")),
@@ -283,6 +301,12 @@ def home_snapshot_from_scan_cycle(
                 PositionSummary(
                     symbol=str(row.get("symbol", "")),
                     name=str(row.get("full_name", row.get("full_asset_name", row.get("symbol", "")))),
+                    description=_optional_string(
+                        row.get(
+                            "description",
+                            row.get("full_name", row.get("full_asset_name", row.get("symbol"))),
+                        )
+                    ),
                     asset_class=_optional_string(row.get("asset_class")),
                     value=_optional_decimal(row.get("current_price")),
                     score=_optional_decimal(row.get("opportunity_score")),
@@ -369,18 +393,34 @@ def live_system_status_from_runtime(
         "market_session_state": ("cycle", "market_session_state"),
         "freshness_state": ("cycle", "freshness_state"),
         "top_opportunity_count": ("scanner", "top_opportunity_count"),
+        "scanner_asset_class_counts": ("scanner", "asset_class_counts"),
         "automatic_pilot_armed": ("demo", "automatic_pilot_armed"),
         "execution_enabled": ("demo", "execution_enabled"),
         "last_submission_status": ("demo", "last_submission_status"),
         "demo_broker_write_calls": ("demo", "broker_write_calls"),
-        "execution_available": ("real", "execution_available"),
+        "demo_broker_write_calls_last_poll": ("demo", "last_poll_broker_write_calls"),
+        "risk_manager_reached": ("demo", "risk_manager_reached"),
+        "execution_admission_gate_reached": ("demo", "execution_admission_gate_reached"),
         "broker_write_calls_real": ("real", "broker_write_calls"),
         "activity_code": ("activity", "code"),
         "blockers": ("activity", "blockers"),
         "last_error": ("activity", "last_error"),
+        "package_material_diagnostics": ("activity", "package_material_diagnostics"),
+        "package_sizing_diagnostics": ("activity", "package_sizing_diagnostics"),
+        "quote_freshness_diagnostics": ("activity", "quote_freshness_diagnostics"),
+        "candidate_execution_diagnostics": ("activity", "candidate_execution_diagnostics"),
         "pilot_notional_eur": ("demo", "pilot_notional_eur"),
+        "pilot_notional": ("demo", "pilot_notional"),
+        "pilot_notional_currency": ("demo", "pilot_notional_currency"),
+        "authorized_capital": ("capital", "authorized_capital"),
+        "authorized_capital_currency": ("capital", "currency"),
         "authorized_capital_eur": ("capital", "authorized_capital_eur"),
+        "managed_exposure_limit": ("capital", "managed_exposure_limit"),
+        "managed_exposure_currency": ("capital", "currency"),
+        "managed_exposure_limit_eur": ("capital", "managed_exposure_limit_eur"),
+        "managed_exposure": ("capital", "managed_exposure"),
         "managed_exposure_eur": ("capital", "managed_exposure_eur"),
+        "remaining_authorized_capital": ("capital", "remaining_authorized_capital"),
         "remaining_authorized_capital_eur": ("capital", "remaining_authorized_capital_eur"),
         "sizing_mode": ("capital", "sizing_mode"),
         "active_scanner_universe_count": ("universe", "active_scanner_universe_count"),
@@ -390,6 +430,8 @@ def live_system_status_from_runtime(
         "catalog_market_data_ready_count": ("universe", "catalog_market_data_ready_count"),
         "catalog_blocked_count": ("universe", "catalog_blocked_count"),
         "catalog_pending_count": ("universe", "catalog_pending_count"),
+        "catalog_snapshot_retrieved_at": ("universe", "catalog_as_of"),
+        "bootstrap_snapshot_created_at": ("universe", "bootstrap_as_of"),
         "etoro_discovered_count": ("universe", "etoro_discovered_count"),
         "etoro_verified_count": ("universe", "etoro_verified_count"),
         "market_data_ready_count": ("universe", "market_data_ready_count"),
@@ -408,6 +450,11 @@ def live_system_status_from_runtime(
         "coherent_coverage_minimum": ("acquisition", "minimum_coverage"),
         "news_provider": ("news", "provider"),
         "news_provider_status": ("news", "status"),
+        "news_events_received": ("news", "events_received"),
+        "news_events_fresh": ("news", "events_fresh"),
+        "news_events_material": ("news", "events_material"),
+        "news_scan_completed_at": ("news", "scan_completed_at"),
+        "news_acquisition_error_code": ("news", "acquisition_error_code"),
         "news_rate_limit_triggered": ("news", "rate_limit_triggered"),
         "news_provider_request_count": ("news", "provider_request_count"),
         "news_requests_suppressed_after_rate_limit": (
@@ -427,7 +474,20 @@ def live_system_status_from_runtime(
     for source, (group, target) in field_map.items():
         if source in runtime:
             grouped[group][target] = runtime[source]
-    heartbeat_at = _parse_optional_datetime(runtime.get("observed_at"))
+    # This application deliberately has no Real execution path. Persisted
+    # snapshots from older builds must not make the dashboard claim otherwise.
+    grouped["real"]["execution_available"] = False
+    lease = _mapping(runtime.get("runner_lease"))
+    lease_heartbeat_at = _parse_optional_datetime(lease.get("heartbeat_at"))
+    lease_is_live = (
+        str(lease.get("status", "")).upper() == "ACTIVE"
+        and lease.get("owner_present") is True
+    )
+    heartbeat_at = (
+        lease_heartbeat_at
+        if lease_is_live and lease_heartbeat_at is not None
+        else _parse_optional_datetime(runtime.get("observed_at"))
+    )
     if heartbeat_at is not None:
         reference_time = now or datetime.now(UTC)
         if reference_time.tzinfo is None:
@@ -468,6 +528,13 @@ def _news_snapshot(
     payload = {
         "provider": live_news.get("provider", report.get("news_provider")),
         "status": live_news.get("status", report.get("news_provider_status")),
+        "events_received": live_news.get("events_received", report.get("news_events_received")),
+        "events_fresh": live_news.get("events_fresh", report.get("news_events_fresh")),
+        "events_material": live_news.get("events_material", report.get("news_events_material")),
+        "scan_completed_at": live_news.get(
+            "scan_completed_at", report.get("news_scan_completed_at")
+        ),
+        "acquisition_error_code": live_news.get("acquisition_error_code"),
         "provider_diagnostics": live_news.get(
             "provider_diagnostics", report.get("news_provider_diagnostics", {})
         ),

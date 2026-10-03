@@ -309,6 +309,54 @@ def test_deferred_batch_members_are_explicitly_not_attempted(tmp_path: Path) -> 
     assert sum(state["classification"] == "NOT_ATTEMPTED" for state in states.values()) == 3
 
 
+def test_acquisition_batch_fairly_represents_open_asset_classes(tmp_path: Path) -> None:
+    instruments = (
+        _instrument(1).model_copy(update={"asset_class": AssetClass.EQUITY}),
+        _instrument(2).model_copy(update={"asset_class": AssetClass.EQUITY}),
+        _instrument(3).model_copy(update={"asset_class": AssetClass.ETF}),
+        _instrument(4).model_copy(update={"asset_class": AssetClass.ETF}),
+        _instrument(5),
+        _instrument(6),
+    )
+    client = CatalogClient()
+    coordinator = _coordinator(tmp_path, client=client, batch_size=3, concurrency=1)
+
+    _, telemetry = coordinator.refresh(instruments=instruments, as_of=AS_OF)
+
+    attempted_ids = set(client.calls)
+    assert telemetry["acquisition_instruments_attempted"] == 3
+    assert attempted_ids == {1, 3, 5}
+
+
+def test_acquisition_prioritizes_verified_open_sessions_without_starving_discovery(
+    tmp_path: Path,
+) -> None:
+    instruments = (
+        _instrument(1).model_copy(update={"asset_class": AssetClass.EQUITY}),
+        _instrument(2).model_copy(update={
+            "asset_class": AssetClass.EQUITY,
+            "tags": ("session-state:OPEN_TRADABLE",),
+        }),
+        _instrument(3).model_copy(update={"asset_class": AssetClass.ETF}),
+        _instrument(4).model_copy(update={
+            "asset_class": AssetClass.ETF,
+            "tags": ("session-state:OPEN_TRADABLE",),
+        }),
+        _instrument(5),
+        _instrument(6).model_copy(update={"tags": ("session-state:OPEN_TRADABLE",)}),
+    )
+    client = CatalogClient()
+    coordinator = _coordinator(tmp_path, client=client, batch_size=3, concurrency=1)
+
+    _, first = coordinator.refresh(instruments=instruments, as_of=AS_OF)
+    _, second = coordinator.refresh(instruments=instruments, as_of=AS_OF)
+
+    assert first["acquisition_instruments_attempted"] == 3
+    assert set(client.calls[:3]) == {2, 4, 6}
+    assert second["acquisition_instruments_attempted"] == 3
+    assert set(client.calls[3:]) == {1, 3, 5}
+
+
 def test_bounded_633_batch_has_no_unclassified_remainder(tmp_path: Path) -> None:
     instruments = tuple(_instrument(index) for index in range(1, 634))
     client = CatalogClient()

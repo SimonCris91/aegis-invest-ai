@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from decimal import Decimal
 
+from app.config.models import RiskPolicyConfig
 from app.domain.enums import AssetClass
 from app.domain.portfolio import PortfolioSnapshot
 from app.domain.universe import OpportunityCandidate
@@ -46,7 +47,7 @@ class PortfolioFitEngine:
         if proposed_exposure > portfolio.cash:
             reasons.append("available cash is insufficient")
             score -= Decimal("50")
-        if projected_cash_reserve < Decimal("0.10"):
+        if projected_cash_reserve < RiskPolicyConfig().min_cash_reserve:
             reasons.append("projected cash reserve would be below policy baseline")
             score -= Decimal("30")
         if projected_concentration > Decimal("0.25"):

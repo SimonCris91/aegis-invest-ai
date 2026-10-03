@@ -2,14 +2,22 @@
 
 from decimal import Decimal
 
+from app.config.models import RiskPolicyConfig
 from app.domain.enums import AssetClass, MarketStatus
 from app.policies.engine import AssetPolicyEngine
 from app.policies.models import AssetPolicy
 
-DEFAULT_POLICY_VERSION = "asset-policy-v1"
+DEFAULT_POLICY_VERSION = "asset-policy-v3-crypto-exposure-cap"
 
 
-def conservative_asset_policies() -> tuple[AssetPolicy, ...]:
+def conservative_asset_policies(
+    *, minimum_cash_reserve: Decimal | None = None
+) -> tuple[AssetPolicy, ...]:
+    reserve = (
+        RiskPolicyConfig().min_cash_reserve
+        if minimum_cash_reserve is None
+        else minimum_cash_reserve
+    )
     enabled_long = {
         AssetClass.EQUITY,
         AssetClass.ETF,
@@ -18,8 +26,8 @@ def conservative_asset_policies() -> tuple[AssetPolicy, ...]:
     policies: list[AssetPolicy] = []
     for asset_class in AssetClass:
         if asset_class in enabled_long:
-            exposure = Decimal("0.15") if asset_class is AssetClass.CRYPTO else Decimal("0.25")
-            trade = Decimal("0.05") if asset_class is AssetClass.CRYPTO else Decimal("0.10")
+            exposure = Decimal("0.02") if asset_class is AssetClass.CRYPTO else Decimal("0.25")
+            trade = Decimal("0.02") if asset_class is AssetClass.CRYPTO else Decimal("0.10")
             statuses = (
                 (MarketStatus.OPEN, MarketStatus.CONTINUOUS_24_7)
                 if asset_class is AssetClass.CRYPTO
@@ -35,7 +43,7 @@ def conservative_asset_policies() -> tuple[AssetPolicy, ...]:
                     max_leverage=Decimal("1"),
                     max_position_exposure=exposure,
                     max_new_trade_exposure=trade,
-                    minimum_cash_reserve=Decimal("0.10"),
+                    minimum_cash_reserve=reserve,
                     max_daily_new_trades=3,
                     minimum_confidence=Decimal("0.75")
                     if asset_class is AssetClass.CRYPTO
@@ -79,5 +87,10 @@ def conservative_asset_policies() -> tuple[AssetPolicy, ...]:
     return tuple(policies)
 
 
-def default_asset_policy_engine() -> AssetPolicyEngine:
-    return AssetPolicyEngine(conservative_asset_policies(), policy_version=DEFAULT_POLICY_VERSION)
+def default_asset_policy_engine(
+    *, minimum_cash_reserve: Decimal | None = None
+) -> AssetPolicyEngine:
+    return AssetPolicyEngine(
+        conservative_asset_policies(minimum_cash_reserve=minimum_cash_reserve),
+        policy_version=DEFAULT_POLICY_VERSION,
+    )

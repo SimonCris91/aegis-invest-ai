@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from app.brokers.etoro.client import EtoroApiError
 from app.brokers.etoro.http import HttpResponse
 from app.domain.enums import Currency
 from app.web.manual_demo import ManualDemoOrders, ManualOrderError
@@ -67,6 +68,7 @@ def rig(tmp_path):
         quote_with_diagnostics=lambda *a: (quote, (), now),
         demo_portfolio_payload=lambda: portfolio,
         demo_order_state=lambda *a: NS(value="FILLED"),
+        demo_order_lookup=lambda order_id: NS(value="FILLED"),
     )
     calls = []
 
@@ -90,6 +92,7 @@ def rig(tmp_path):
     )
     return NS(
         service=service,
+        client=client,
         ticket=ticket,
         calls=calls,
         http=http,
@@ -121,6 +124,80 @@ def test_selected_order_and_replay_after_restart(rig):
     again = ManualDemoOrders(rig.service.path, factory=rig.service.factory)
     assert again.submit(dict(preview_id=p["preview_id"], confirmed=True)) == result
     assert len(rig.calls) == 1
+
+
+def test_sell_preview_ignores_browser_placeholder_and_uses_verified_quote(rig):
+    preview = rig.service.preview(
+        {
+            **rig.ticket,
+            "side": "SELL",
+            "amount": "0.01",
+            "position_id": "7",
+            "close_partial": False,
+        }
+    )
+
+    assert preview["status"] == "PREVIEW"
+    assert preview["ticket"]["amount"] == "495.00"
+    assert preview["ticket"]["price"] == "99"
+    assert preview["ticket"]["units"] == "5"
+    assert preview["ticket"]["estimated_pnl"] == "-5.00"
+    assert not rig.calls
+
+
+def test_unconfirmed_order_uses_authoritative_lookup_and_updates_ledger(rig):
+    preview = rig.service.preview(rig.ticket)
+    lookup_calls = []
+    rig.client.demo_order_lookup = lambda order_id: (
+        lookup_calls.append(order_id) or NS(value="FILLED")
+    )
+    rig.client.demo_order_state = lambda *args: (_ for _ in ()).throw(
+        AssertionError("legacy instrument breakdown must not be used")
+    )
+    with rig.service._db() as db:
+        db.execute(
+            "UPDATE manual_orders SET state='UNCONFIRMED', result=? WHERE id=?",
+            (
+                json.dumps({"status": "UNCONFIRMED", "broker_order_id": "382726348"}),
+                preview["preview_id"],
+            ),
+        )
+
+    result = rig.service.status({"preview_id": preview["preview_id"]})
+
+    assert lookup_calls == ["382726348"]
+    assert result["status"] == "FILLED"
+    assert rig.service.recent()["orders"][0]["status"] == "FILLED"
+
+
+def test_unconfirmed_order_404_stays_unknown_and_is_reported_explicitly(rig):
+    preview = rig.service.preview(rig.ticket)
+    with rig.service._db() as db:
+        db.execute(
+            "UPDATE manual_orders SET state='UNCONFIRMED', result=? WHERE id=?",
+            (
+                json.dumps({"status": "UNCONFIRMED", "broker_order_id": "382726348"}),
+                preview["preview_id"],
+            ),
+        )
+
+    def missing_from_lookup(_order_id):
+        raise EtoroApiError(
+            "eToro order was not found", endpoint="/api/v2/trading/info/demo/orders:lookup",
+            status=404,
+        )
+
+    rig.client.demo_order_lookup = missing_from_lookup
+
+    result = rig.service.status({"preview_id": preview["preview_id"]})
+
+    assert result["status"] == "UNCONFIRMED"
+    assert result["broker_lookup_http_status"] == "404"
+    assert "HTTP 404" in result["message"]
+    assert "non confermato" in result["message"]
+    assert "non reinviare" in result["message"]
+    assert rig.service.recent()["orders"][0]["broker_lookup_http_status"] == "404"
+    assert not rig.calls
 
 
 @pytest.mark.parametrize("amount", ["0", "-1", "NaN", "Infinity", "1.001", "100000001"])
@@ -189,7 +266,12 @@ def test_sell_owned_position_only(rig):
     result = rig.service.submit(dict(preview_id=p["preview_id"], confirmed=True))
     assert result["status"] == "FILLED"
     assert rig.calls[0][0].endswith("/demo/market-close-orders/positions/7")
+    assert rig.calls[0][1]["InstrumentId"] == int(rig.ticket["instrument_id"])
     assert rig.calls[0][1]["UnitsToDeduct"] is None
+    recent = rig.service.recent()["orders"][0]
+    assert recent["source"] == "MANUAL_USER_DIRECTED"
+    assert recent["statistics_scope"] == "EXCLUDED_FROM_AEGIS"
+    assert rig.service.aegis_statistics_excluded_position_ids() == {"7"}
     with pytest.raises(ManualOrderError):
         rig.service.preview({**ticket, "position_id": "8"})
 

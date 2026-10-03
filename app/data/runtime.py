@@ -36,6 +36,7 @@ from app.brokers.etoro.mapping import (
 from app.brokers.etoro.runtime import runtime_credentials
 from app.brokers.etoro.scanner_adapter import EtoroMarketScannerAdapter
 from app.config.models import ApplicationConfig
+from app.data.bootstrap_retry import next_cooldown, persisted_cooldown
 from app.data.events.engine import NullEventRiskProvider
 from app.data.historical.alpaca import AlpacaHistoricalMarketDataProvider
 from app.data.historical.cache import HistoricalDataCache
@@ -88,7 +89,7 @@ from app.scanner.active import (
     ActiveScannerResult,
     IntradayFreshnessStatus,
     _instrument_id,
-    _is_market_closed_as_of,
+    _market_closed_for_instrument,
     _observation_from_candidate,
     active_scanner_inventory,
     classify_intraday_freshness,
@@ -144,10 +145,16 @@ EXITPOLICY_V2_BALANCED_CANDIDATE_FINGERPRINT = (
 EXITPOLICY_V2_EXPOSED_HOLDOUT_FINGERPRINT = (
     "e5b55e9b301878ac81fb41523c14407138ad7f5165a8b0cc68f3f2adc78ce837"
 )
-DEFAULT_REAL_VALIDATION_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r" && .venv\Scripts\python.exe -m app.main validate-strategies --real-data "
+
+
+def _windows_repo_command(command: str) -> str:
+    """Build a Windows command rooted at this active checkout, not an old C: copy."""
+    repo_root = Path(__file__).resolve().parents[2]
+    return f'cd /d "{repo_root}" && {command}'
+
+
+DEFAULT_REAL_VALIDATION_WINDOWS_CMD = _windows_repo_command(
+    r".venv\Scripts\python.exe -m app.main validate-strategies --real-data "
     r"--timeframe 1D --max-instruments 9"
 )
 EXIT_EVIDENCE_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
@@ -193,10 +200,8 @@ EXIT_EVIDENCE_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
     ),
 }
 EXIT_EVIDENCE_TIMEFRAMES = (TimeFrame.ONE_DAY, TimeFrame.FOUR_HOUR)
-DEFAULT_EXIT_EVIDENCE_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r' && set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
+DEFAULT_EXIT_EVIDENCE_WINDOWS_CMD = _windows_repo_command(
+    'set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
     r" && .venv\Scripts\python.exe -m app.main acquire-exit-evidence"
 )
 POLYGON_PILOT_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
@@ -205,10 +210,8 @@ POLYGON_PILOT_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
     AssetClass.CRYPTO: ("BTC",),
 }
 POLYGON_PILOT_TIMEFRAMES = (TimeFrame.ONE_DAY, TimeFrame.FOUR_HOUR)
-DEFAULT_POLYGON_PILOT_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r" && .venv\Scripts\python.exe -m app.main polygon-provider-pilot"
+DEFAULT_POLYGON_PILOT_WINDOWS_CMD = _windows_repo_command(
+    r".venv\Scripts\python.exe -m app.main polygon-provider-pilot"
 )
 ALPACA_PILOT_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
     AssetClass.EQUITY: ("AAPL",),
@@ -231,47 +234,33 @@ ALPACA_CORE_4H_SYMBOLS_BY_CLASS: dict[AssetClass, tuple[str, ...]] = {
 }
 ALPACA_PILOT_TIMEFRAMES = (TimeFrame.ONE_DAY, TimeFrame.FOUR_HOUR)
 ALPACA_CORE_4H_TIMEFRAMES = (TimeFrame.FOUR_HOUR,)
-DEFAULT_ALPACA_PILOT_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r" && .venv\Scripts\python.exe -m app.main alpaca-provider-pilot"
+DEFAULT_ALPACA_PILOT_WINDOWS_CMD = _windows_repo_command(
+    r".venv\Scripts\python.exe -m app.main alpaca-provider-pilot"
 )
-DEFAULT_ALPACA_FULL_BACKFILL_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r" && .venv\Scripts\python.exe -m app.main alpaca-full-backfill"
+DEFAULT_ALPACA_FULL_BACKFILL_WINDOWS_CMD = _windows_repo_command(
+    r".venv\Scripts\python.exe -m app.main alpaca-full-backfill"
 )
-DEFAULT_ALPACA_CORE_4H_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r" && .venv\Scripts\python.exe -m app.main alpaca-core-4h-backfill"
+DEFAULT_ALPACA_CORE_4H_WINDOWS_CMD = _windows_repo_command(
+    r".venv\Scripts\python.exe -m app.main alpaca-core-4h-backfill"
 )
-DEFAULT_ACTIVE_SCANNER_1H_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r' && set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
-    r' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
+DEFAULT_ACTIVE_SCANNER_1H_WINDOWS_CMD = _windows_repo_command(
+    'set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
+    ' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
     r" && .venv\Scripts\python.exe -m app.main active-scanner-1h-foundation"
 )
-DEFAULT_ACTIVE_SCANNER_1H_PILOT_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r' && set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
-    r' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
+DEFAULT_ACTIVE_SCANNER_1H_PILOT_WINDOWS_CMD = _windows_repo_command(
+    'set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
+    ' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
     r" && .venv\Scripts\python.exe -m app.main active-scanner-1h-pilot"
 )
-DEFAULT_ACTIVE_SCANNER_1H_IEX_EQUITY_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r' && set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
-    r' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
+DEFAULT_ACTIVE_SCANNER_1H_IEX_EQUITY_WINDOWS_CMD = _windows_repo_command(
+    'set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
+    ' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
     r" && .venv\Scripts\python.exe -m app.main active-scanner-1h-iex-pilot"
 )
-DEFAULT_ACTIVE_SCANNER_1H_FULL_UNIVERSE_WINDOWS_CMD = (
-    "cd /d "
-    r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-    r' && set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
-    r' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
+DEFAULT_ACTIVE_SCANNER_1H_FULL_UNIVERSE_WINDOWS_CMD = _windows_repo_command(
+    'set "AEGIS_CONFIDENCE_PROFILE=V2_B_GUARDED"'
+    ' && set "AEGIS_EXIT_POLICY_PROFILE=EXITPOLICY_V2_GUARDED"'
     r" && .venv\Scripts\python.exe -m app.main active-scanner-1h-full-universe-sweep"
 )
 ALPACA_STOCK_ETF_BACKFILL_START = datetime(2016, 1, 4, tzinfo=UTC)
@@ -422,10 +411,8 @@ def build_live_intelligence_report(
             }
             for item in run.results
         ),
-        "windows_cmd": (
-            "cd /d "
-            r"C:\Users\simon\Documents\Codex\2026-08-28\ahhh-s-ho-capito-cosa-intendi"
-            r" && .venv\Scripts\python.exe -m app.main intelligence-live"
+        "windows_cmd": _windows_repo_command(
+            r".venv\Scripts\python.exe -m app.main intelligence-live"
         ),
     }
 
@@ -899,17 +886,135 @@ def build_etoro_universe_bootstrap_report(
     assert snapshot is not None
     snapshot_id = str(snapshot["snapshot_id"])
     progress: dict[str, dict[str, object]] = {}
+    retry_not_before: datetime | None = None
+    rate_limit_attempts = 0
+    cooldown_source: str | None = None
+    preserved_previous_statuses = 0
+    bootstrap_rechecks = 0
     if progress_path.exists():
         with progress_path.open(encoding="utf-8") as handle:
             existing = json.load(handle)
-        if isinstance(existing, dict) and existing.get("source_snapshot_id") == snapshot_id:
+        if isinstance(existing, dict):
+            retry_not_before, rate_limit_attempts = persisted_cooldown(existing)
+            cooldown_source = str(existing.get("cooldown_source") or "LEGACY_CHECKPOINT")
             raw_records = existing.get("records", [])
             if isinstance(raw_records, list):
-                progress = {
+                previous_records = {
                     str(record["instrument_id"]): record
                     for record in raw_records
                     if isinstance(record, dict) and record.get("instrument_id") is not None
                 }
+                if existing.get("source_snapshot_id") == snapshot_id:
+                    progress = previous_records
+                else:
+                    # A catalog refresh changes its content hash. Carry forward
+                    # only statuses whose broker ID and supported asset class
+                    # still identify the same instrument; re-bootstrap renamed
+                    # active instruments and retry transient provider failures.
+                    current_by_id = {
+                        _catalog_value(item, "instrumentID", "instrumentId"): item
+                        for item in items
+                    }
+                    for instrument_id, prior in previous_records.items():
+                        item = current_by_id.get(instrument_id)
+                        if item is None:
+                            continue
+                        normalized_class = _catalog_asset_class(item)
+                        symbol = _catalog_value(item, "symbolFull")
+                        display_name = _catalog_value(item, "instrumentDisplayName") or symbol
+                        prior_status = str(prior.get("status", ""))
+                        same_class = prior.get("asset_class") == normalized_class
+                        current_internal = item.get("isInternalInstrument") is True
+
+                        if current_internal:
+                            progress[instrument_id] = {
+                                **prior,
+                                "symbol": symbol,
+                                "display_name": display_name,
+                                "asset_class": normalized_class,
+                                "status": "UNSUPPORTED_INTERNAL",
+                                "reason": "PROVIDER_AUTHORITATIVE_IS_INTERNAL_INSTRUMENT_TRUE",
+                            }
+                            preserved_previous_statuses += 1
+                        elif normalized_class not in {"EQUITY", "ETF", "CRYPTO"}:
+                            progress[instrument_id] = {
+                                **prior,
+                                "symbol": symbol,
+                                "display_name": display_name,
+                                "asset_class": normalized_class,
+                                "status": "UNSUPPORTED",
+                                "reason": "ASSET_CLASS_NOT_SUPPORTED_BY_ETORO_NATIVE_SCANNER",
+                            }
+                            preserved_previous_statuses += 1
+                        elif prior_status in {"UNSUPPORTED", "UNSUPPORTED_INTERNAL"}:
+                            # A refreshed catalog can make a previously blocked
+                            # instrument eligible (for example when eToro
+                            # clears its internal-instrument flag).  Do not
+                            # carry the old terminal block into the new
+                            # snapshot; let the normal data probe decide.
+                            progress.pop(instrument_id, None)
+                            bootstrap_rechecks += 1
+                        elif prior_status == "BOOTSTRAPPED" and same_class and prior.get("symbol") == symbol:
+                            progress[instrument_id] = {
+                                **prior,
+                                "symbol": symbol,
+                                "display_name": display_name,
+                                "asset_class": normalized_class,
+                            }
+                            preserved_previous_statuses += 1
+                        elif prior_status == "NO_DATA" and same_class:
+                            # NO_DATA is tied to the stable broker instrument ID;
+                            # keep that finding but refresh its display metadata.
+                            progress[instrument_id] = {
+                                **prior,
+                                "symbol": symbol,
+                                "display_name": display_name,
+                                "asset_class": normalized_class,
+                            }
+                            preserved_previous_statuses += 1
+                        else:
+                            if prior_status in {"BOOTSTRAPPED", "ERROR_RETRYABLE"}:
+                                bootstrap_rechecks += 1
+    if retry_not_before is not None and now < retry_not_before:
+        status_counts = Counter(str(record["status"]) for record in progress.values())
+        pending = max(0, len(items) - len(progress))
+        retryable = status_counts.get("ERROR_RETRYABLE", 0)
+        active_count = sum(
+            progress.get(_catalog_value(item, "instrumentID", "instrumentId"), {}).get("status")
+            == "BOOTSTRAPPED"
+            and item.get("isInternalInstrument") is not True
+            for item in items
+        )
+        return {
+            "status": "ETORO_UNIVERSE_BOOTSTRAP_RATE_LIMITED",
+            "rate_limited": True,
+            "cooldown_active": True,
+            "retry_not_before": retry_not_before.isoformat(),
+            "rate_limit_attempts": rate_limit_attempts,
+            "cooldown_source": cooldown_source,
+            "requests_attempted": 0,
+            "catalog_count": len(items),
+            "checked": len(progress),
+            "pending": pending,
+            "retryable": retryable,
+            "remaining": pending + retryable,
+            "data_capable": status_counts.get("BOOTSTRAPPED", 0)
+            + status_counts.get("DATA_CAPABLE", 0),
+            "bootstrapped": status_counts.get("BOOTSTRAPPED", 0),
+            "active_scanner_universe": active_count,
+            "blocked": len(progress) - active_count,
+            "status_counts": dict(sorted(status_counts.items())),
+            "preserved_previous_snapshot_statuses": preserved_previous_statuses,
+            "instruments_rechecked_after_catalog_change": bootstrap_rechecks,
+            "progress_path": str(progress_path),
+            "active_universe_path": str(artifact_path),
+            "broker_write_calls": 0,
+            "demo_post_attempts": 0,
+            "real_execution_available": False,
+        }
+    retry_not_before = None
+    cooldown_source = None
+    requests_attempted = 0
     effective_cache = cache or HistoricalDataCache(DEFAULT_MARKET_DATA_CACHE_PATH)
     read_client = client
     if read_client is None:
@@ -950,10 +1055,10 @@ def build_etoro_universe_bootstrap_report(
         )
     assert read_client is not None
     progress_items: list[dict[str, object]] = [progress[key] for key in sorted(progress)]
+    rate_limited = False
     terminal_statuses = {
         "BOOTSTRAPPED",
         "NO_DATA",
-        "ERROR_RETRYABLE",
         "UNSUPPORTED",
         "UNSUPPORTED_INTERNAL",
     }
@@ -1000,12 +1105,14 @@ def build_etoro_universe_bootstrap_report(
                     (TimeFrame.ONE_HOUR, "OneHour"),
                     (TimeFrame.ONE_DAY, "OneDay"),
                 ):
+                    requests_attempted += 1
                     raw = read_client.candle_history(
                         instrument_id=int(instrument_id),
                         direction="asc",
                         interval=interval,
                         candles_count=ETORO_UNIVERSE_BOOTSTRAP_BARS,
                     )
+                    rate_limit_attempts = 0
                     bars = tuple(
                         bar
                         for bar in _normalize_etoro_candles(
@@ -1032,8 +1139,21 @@ def build_etoro_universe_bootstrap_report(
             except EtoroApiError as exc:
                 metadata = exc.safe_metadata()
                 status = "ERROR_RETRYABLE"
-                reason = str(metadata.get("category", "ETORO_API_ERROR"))
+                rate_limited = exc.status == 429
+                reason = (
+                    "RATE_LIMITED"
+                    if rate_limited
+                    else str(metadata.get("category", "ETORO_API_ERROR"))
+                )
                 error = {"category": reason, "status": metadata.get("http_status")}
+                if rate_limited:
+                    rate_limit_attempts += 1
+                    observed_at = (clock or (lambda: datetime.now(UTC)))()
+                    retry_not_before, cooldown_source = next_cooldown(
+                        exc.response_headers,
+                        observed_at=observed_at,
+                        attempts=rate_limit_attempts,
+                    )
             except Exception as exc:
                 status = "ERROR_RETRYABLE"
                 reason = type(exc).__name__
@@ -1051,6 +1171,8 @@ def build_etoro_universe_bootstrap_report(
             }
         progress[instrument_id] = record
         if prior == record:
+            if rate_limited:
+                break
             continue
         progress_items = [progress[key] for key in sorted(progress)]
         _atomic_json_write(
@@ -1062,6 +1184,9 @@ def build_etoro_universe_bootstrap_report(
                 "source_endpoint": snapshot["source_endpoint"],
                 "required_timeframes": [TimeFrame.ONE_HOUR.value, TimeFrame.ONE_DAY.value],
                 "requested_bars_per_timeframe": ETORO_UNIVERSE_BOOTSTRAP_BARS,
+                "retry_not_before": retry_not_before.isoformat() if retry_not_before else None,
+                "rate_limit_attempts": rate_limit_attempts,
+                "cooldown_source": cooldown_source,
                 "updated_at": now.isoformat(),
                 "records": progress_items,
             },
@@ -1072,8 +1197,29 @@ def build_etoro_universe_bootstrap_report(
             artifact_path=artifact_path,
             created_at=now,
         )
+        if rate_limited:
+            # A provider 429 is shared across instruments. Persist the failed
+            # cursor and stop this pass instead of repeating the same request
+            # for every remaining catalog item.
+            break
         if (index + 1) % batch_size == 0 and delay_seconds:
             (sleeper or time.sleep)(delay_seconds)
+    _atomic_json_write(
+        progress_path,
+        {
+            "schema_version": 1,
+            "source_snapshot_id": snapshot_id,
+            "source_snapshot_checksum_sha256": snapshot["snapshot_checksum_sha256"],
+            "source_endpoint": snapshot["source_endpoint"],
+            "required_timeframes": [TimeFrame.ONE_HOUR.value, TimeFrame.ONE_DAY.value],
+            "requested_bars_per_timeframe": ETORO_UNIVERSE_BOOTSTRAP_BARS,
+            "retry_not_before": retry_not_before.isoformat() if retry_not_before else None,
+            "rate_limit_attempts": rate_limit_attempts,
+            "cooldown_source": cooldown_source,
+            "updated_at": now.isoformat(),
+            "records": progress_items,
+        },
+    )
     artifact = _write_etoro_native_active_artifact(
         snapshot=snapshot,
         progress_records=progress_items,
@@ -1081,15 +1227,36 @@ def build_etoro_universe_bootstrap_report(
         created_at=now,
     )
     status_counts = Counter(str(record["status"]) for record in progress_items)
+    pending = max(0, len(items) - len(progress_items))
+    retryable = status_counts.get("ERROR_RETRYABLE", 0)
     return {
-        "status": "ETORO_UNIVERSE_BOOTSTRAP_COMPLETE",
+        "status": (
+            "ETORO_UNIVERSE_BOOTSTRAP_RATE_LIMITED"
+            if rate_limited
+            else (
+                "ETORO_UNIVERSE_BOOTSTRAP_INCOMPLETE"
+                if pending or retryable
+                else "ETORO_UNIVERSE_BOOTSTRAP_COMPLETE"
+            )
+        ),
+        "rate_limited": rate_limited,
+        "cooldown_active": rate_limited,
+        "retry_not_before": retry_not_before.isoformat() if retry_not_before else None,
+        "rate_limit_attempts": rate_limit_attempts,
+        "cooldown_source": cooldown_source,
+        "requests_attempted": requests_attempted,
         "catalog_count": len(items),
         "checked": len(progress_items),
+        "pending": pending,
+        "retryable": retryable,
+        "remaining": pending + retryable,
         "data_capable": status_counts.get("BOOTSTRAPPED", 0) + status_counts.get("DATA_CAPABLE", 0),
         "bootstrapped": status_counts.get("BOOTSTRAPPED", 0),
         "active_scanner_universe": len(cast(list[object], artifact["active_records"])),
         "blocked": len(progress_items) - len(cast(list[object], artifact["active_records"])),
         "status_counts": dict(sorted(status_counts.items())),
+        "preserved_previous_snapshot_statuses": preserved_previous_statuses,
+        "instruments_rechecked_after_catalog_change": bootstrap_rechecks,
         "progress_path": str(progress_path),
         "active_universe_path": str(artifact_path),
         "broker_write_calls": 0,
@@ -2965,6 +3132,19 @@ def build_exit_policy_v2_train_validation_report(
             if partition.role == "VALIDATION":
                 validation_rows.append(row)
     selected = _select_exit_policy_v2_candidate(validation_rows)
+    required_asset_classes = tuple(
+        sorted(
+            {
+                partition.asset_class.value
+                for partition in manifest.dataset_partitions
+                if partition.role == "VALIDATION"
+            }
+        )
+    )
+    multi_asset_qualification = _exit_policy_v2_multi_asset_qualification(
+        validation_rows,
+        required_asset_classes=required_asset_classes,
+    )
     return {
         "status": selected["status"],
         "phase": "STEP_8_0W_EXECUTE_PREREGISTERED_V2_TRAIN_VALIDATION",
@@ -2978,6 +3158,12 @@ def build_exit_policy_v2_train_validation_report(
         "candidate_registry_fingerprint": registry.fingerprint,
         "candidate_bundle_count": len(registry.candidate_bundles),
         "safety_invariants": manifest.safety_invariants,
+        "candidate_selection_scope": (
+            "CROSS_ASSET"
+            if multi_asset_qualification["status"] == "CROSS_ASSET_VALIDATION_QUALIFIED"
+            else "NOT_MULTI_ASSET_VALIDATED"
+        ),
+        "multi_asset_qualification": multi_asset_qualification,
         "research_exposed_ranges": tuple(
             partition.model_dump(mode="json") for partition in manifest.research_exposed_ranges
         ),
@@ -3418,8 +3604,7 @@ def build_readonly_active_scan_cycle_report(
         shadow_capital=Decimal("200"),
     )
     if cycle is None:
-        persisted = audit_store.cycles()
-        last = persisted[-1] if persisted else {}
+        last = audit_store.latest_cycle() or {}
         last_scanner = last.get("scanner_result", {})
         candidate_rows = (
             last_scanner.get("candidates", ()) if isinstance(last_scanner, dict) else ()
@@ -3431,7 +3616,7 @@ def build_readonly_active_scan_cycle_report(
             "execution_mode": "READ_ONLY",
             "scanner_cycle_status": "NO_CYCLE",
             "scan_cycle_timestamp": (
-                persisted[-1].get("scan_cycle_timestamp") if persisted else None
+                last.get("scan_cycle_timestamp")
             ),
             "universe_scanned": tuple(instrument.symbol for instrument in instruments),
             "assets_requested": len(instruments),
@@ -4560,11 +4745,12 @@ def _active_scanner_1h_acquisition_row(
         "market_session_semantics": (
             "24/7 crypto"
             if instrument.asset_class is AssetClass.CRYPTO
-            else "US equity/ETF market-session aware"
+            else "per-instrument equity/ETF market-session aware"
         ),
         "market_session_state": (
             "OPEN"
-            if instrument.asset_class is AssetClass.CRYPTO or not _is_market_closed_as_of(now)
+            if instrument.asset_class is AssetClass.CRYPTO
+            or not _market_closed_for_instrument(instrument=instrument, as_of=now)
             else "CLOSED"
         ),
         "expected_latest_bar": (
@@ -4765,14 +4951,7 @@ def _select_exit_policy_v2_candidate(validation_rows: list[dict[str, object]]) -
         row for row in validation_rows if row.get("status") == "EXECUTED_TRAIN_VALIDATION_ONLY"
     )
     qualifying = tuple(
-        row
-        for row in executed_rows
-        if _row_int(row, "completed_trades") >= 3
-        and _row_int(row, "close") > 0
-        and _row_decimal(row, "max_drawdown") <= Decimal("0.25")
-        and _row_int(row, "cooldown_reentry_blocks") >= 0
-        and _row_int(row, "data_quality_exclusions") == 0
-        and _row_decimal(row, "realized_pnl") >= Decimal("0")
+        row for row in executed_rows if _exit_policy_v2_validation_row_qualifies(row)
     )
     if not qualifying:
         return {
@@ -4802,6 +4981,56 @@ def _select_exit_policy_v2_candidate(validation_rows: list[dict[str, object]]) -
         ),
         "selected_candidate_bundle_id": selected["candidate_bundle_id"],
         "selected_candidate_bundle_fingerprint": selected["candidate_bundle_fingerprint"],
+    }
+
+
+def _exit_policy_v2_validation_row_qualifies(row: dict[str, object]) -> bool:
+    return (
+        _row_int(row, "completed_trades") >= 3
+        and _row_int(row, "close") > 0
+        and _row_decimal(row, "max_drawdown") <= Decimal("0.25")
+        and _row_int(row, "cooldown_reentry_blocks") >= 0
+        and _row_int(row, "data_quality_exclusions") == 0
+        and _row_decimal(row, "realized_pnl") >= Decimal("0")
+    )
+
+
+def _exit_policy_v2_multi_asset_qualification(
+    validation_rows: list[dict[str, object]],
+    *,
+    required_asset_classes: tuple[str, ...],
+) -> dict[str, object]:
+    qualifying_by_class = {
+        asset_class: tuple(
+            sorted(
+                {
+                    str(row["candidate_bundle_id"])
+                    for row in validation_rows
+                    if row.get("asset_class") == asset_class
+                    and row.get("status") == "EXECUTED_TRAIN_VALIDATION_ONLY"
+                    and _exit_policy_v2_validation_row_qualifies(row)
+                }
+            )
+        )
+        for asset_class in required_asset_classes
+    }
+    qualifying_sets = [set(candidate_ids) for candidate_ids in qualifying_by_class.values()]
+    cross_asset_candidates = set.intersection(*qualifying_sets) if qualifying_sets else set()
+    missing_classes = tuple(
+        asset_class
+        for asset_class, candidate_ids in qualifying_by_class.items()
+        if not candidate_ids
+    )
+    return {
+        "status": (
+            "CROSS_ASSET_VALIDATION_QUALIFIED"
+            if cross_asset_candidates
+            else "CROSS_ASSET_VALIDATION_INSUFFICIENT"
+        ),
+        "required_asset_classes": required_asset_classes,
+        "qualifying_candidate_bundle_ids_by_asset_class": qualifying_by_class,
+        "cross_asset_qualified_candidate_bundle_ids": tuple(sorted(cross_asset_candidates)),
+        "asset_classes_without_a_qualifying_candidate": missing_classes,
     }
 
 

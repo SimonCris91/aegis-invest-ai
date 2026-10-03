@@ -1,7 +1,7 @@
 """eToro Demo-only execution adapter with exact-route and replay guards."""
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 from app.brokers.etoro.auth import EtoroCredentials
@@ -133,21 +133,47 @@ class EtoroDemoAdapter:
             "proposal_id": str(proposal.proposal_id),
             "authorization_id": str(trade.authorization.authorization_id),
             "request_id": request_id,
+            # Keep an immutable timestamp from the instant the idempotent
+            # reservation is written. Legacy rows without this field remain
+            # explicitly undated rather than inheriting the database mtime.
+            "created_at": datetime.now(UTC).isoformat(),
             "instrument_id": proposal.instrument_id,
             "symbol": proposal.symbol,
-            "amount_eur": str(proposal.amount),
+            "account_currency": proposal.currency.value,
+            "amount_account_currency": str(proposal.amount),
             "action": proposal.intent.value,
         }
+        if proposal.currency.value == "EUR":
+            persisted["amount_eur"] = str(proposal.amount)
         if not self._registry.reserve_demo_submission(proposal.idempotency_key, persisted):
             raise DemoExecutionError("duplicate or restarted Demo submission is blocked")
 
         # Final kill-switch/capability check immediately before HTTP.
-        self._assert_kill_switch_clear()
-        self._gate.assert_admitted(trade, at=self._clock())
+        try:
+            self._assert_kill_switch_clear()
+            self._gate.assert_admitted(trade, at=self._clock())
+        except (DemoExecutionError, PermissionError):
+            # Nothing has been sent to the broker. Do not leave a RESERVED
+            # record that looks like an order with an unknown outcome.
+            self._registry.update_demo_submission(
+                proposal.idempotency_key,
+                ExecutionState.REJECTED.value,
+                {**persisted, "rejection_reason": "PRE_POST_SAFETY_GATE_REJECTED"},
+            )
+            raise
         if self._tradability_revalidator is not None:
-            if not self._tradability_revalidator(
-                proposal.instrument_id, proposal.symbol, self._clock()
-            ):
+            try:
+                tradable = self._tradability_revalidator(
+                    proposal.instrument_id, proposal.symbol, self._clock()
+                )
+            except Exception as exc:
+                self._registry.update_demo_submission(
+                    proposal.idempotency_key,
+                    ExecutionState.REJECTED.value,
+                    {**persisted, "rejection_reason": "PRE_POST_TRADABILITY_REVALIDATION_UNAVAILABLE"},
+                )
+                raise DemoExecutionError("pre-POST tradability revalidation unavailable") from exc
+            if not tradable:
                 self._registry.update_demo_submission(
                     proposal.idempotency_key,
                     ExecutionState.REJECTED.value,
@@ -166,7 +192,11 @@ class EtoroDemoAdapter:
             self._registry.update_demo_submission(
                 proposal.idempotency_key,
                 ExecutionState.REJECTED.value,
-                {**persisted, "http_status": response.status},
+                {
+                    **persisted,
+                    "http_status": response.status,
+                    "broker_rejected_at": datetime.now(UTC).isoformat(),
+                },
             )
             return self._submission(trade, request_id, ExecutionState.REJECTED)
         try:
@@ -189,7 +219,11 @@ class EtoroDemoAdapter:
         self._registry.update_demo_submission(
             proposal.idempotency_key,
             ExecutionState.SUBMITTED.value,
-            {**persisted, "broker_order_id": order_id},
+            {
+                **persisted,
+                "broker_order_id": order_id,
+                "submitted_at": submission.submitted_at.isoformat(),
+            },
         )
         return submission
 

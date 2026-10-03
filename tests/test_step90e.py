@@ -88,6 +88,29 @@ def test_future_market_data_and_future_news_are_not_visible() -> None:
     assert record.broker_write_calls == 0
 
 
+def test_run_cycle_uses_news_in_scanner_decision_not_only_audit_context() -> None:
+    as_of = datetime(2026, 8, 28, 10, tzinfo=UTC)
+    instrument = _instrument("AAPL", AssetClass.EQUITY, "1001", as_of)
+    news_engine = GlobalNewsIntelligenceEngine(
+        NewsFeedProvider(
+            items=(_news("Apple beats earnings", as_of - timedelta(minutes=5)),)
+        )
+    )
+
+    record = AegisActiveIntelligenceOrchestrator(news_engine=news_engine).run_cycle(
+        scheduled_at=as_of,
+        instruments=(instrument,),
+        bars_by_symbol={"AAPL": _bars(instrument, end=as_of, count=70)},
+        portfolio=_portfolio(as_of),
+        timeframe=TimeFrame.ONE_HOUR,
+    )
+
+    candidate = record.scanner_result["candidates"][0]
+    assert candidate["news_sentiment"] == "POSITIVE"
+    assert candidate["material_event_count"] == 1
+    assert candidate["news_relevance"] > "0"
+
+
 def test_same_market_bar_can_be_reused_while_news_changes_between_bars() -> None:
     start = datetime(2026, 8, 28, 10, tzinfo=UTC)
     instrument = _instrument("BTC", AssetClass.CRYPTO, "4001", start)

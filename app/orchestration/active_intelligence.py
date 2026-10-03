@@ -26,8 +26,7 @@ from app.scanner.active import (
     ActiveMarketScanner,
     ActiveScannerResult,
     _expected_completed_one_hour_bar_timestamp,
-    _is_market_closed_as_of,
-    attach_observational_news_context,
+    _market_closed_for_instrument,
 )
 from app.storage.sqlite import ActiveOrchestrationClaim, SqliteRecordStore
 
@@ -127,6 +126,9 @@ class ActiveIntelligenceAuditStore:
 
     def cycles(self) -> tuple[dict[str, object], ...]:
         return self._store.list("active-intelligence-cycle")
+
+    def latest_cycle(self) -> dict[str, object] | None:
+        return self._store.latest("active-intelligence-cycle")
 
     def accepted_active_cycles(self) -> dict[str, datetime]:
         return self._store.accepted_active_cycles()
@@ -258,6 +260,10 @@ class AegisActiveIntelligenceOrchestrator:
             as_of=scheduled_at,
             timeframe=timeframe,
         )
+        # News must be acquired before ranking.  Attaching the contexts only
+        # after scan makes them observable in the audit/UI but leaves the
+        # ranking and BUY/HOLD decision unchanged.
+        news_result = self._news.analyze(instruments=instruments, as_of=scheduled_at)
         scanner_result = self._scanner.scan(
             instruments=instruments,
             bars_by_symbol=visible_bars,
@@ -265,10 +271,7 @@ class AegisActiveIntelligenceOrchestrator:
             as_of=scheduled_at,
             timeframe=timeframe,
             simulated_capital=shadow_capital,
-        )
-        news_result = self._news.analyze(instruments=instruments, as_of=scheduled_at)
-        scanner_result = attach_observational_news_context(
-            scanner_result, news_result.asset_contexts
+            news_context_by_symbol=news_result.asset_contexts,
         )
         self._last_scanner_result = scanner_result
         record = ActiveIntelligenceCycleRecord(
@@ -384,7 +387,7 @@ class AegisActiveIntelligenceOrchestrator:
             force_universe_reconciliation
             and asset_classes is None
             and _universe_expanded_since_last_cycle(
-                self._store.cycles(),
+                self._store.latest_cycle(),
                 current_symbols={instrument.symbol for instrument in scoped_instruments},
             )
         )
@@ -586,7 +589,7 @@ def causal_completed_bars(
         bar for bar in bars_by_symbol if bar.timeframe is timeframe and bar.timestamp <= as_of
     )
     if instrument.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
-        if not _is_market_closed_as_of(as_of):
+        if not _market_closed_for_instrument(instrument=instrument, as_of=as_of):
             cutoff = _expected_completed_one_hour_bar_timestamp(as_of)
             bars = tuple(bar for bar in bars if bar.timestamp <= cutoff)
     return bars
@@ -605,7 +608,7 @@ def _has_new_bar(
 
 
 def _universe_expanded_since_last_cycle(
-    cycles: tuple[dict[str, object], ...],
+    last_cycle: dict[str, object] | None,
     *,
     current_symbols: set[str],
 ) -> bool:
@@ -617,9 +620,9 @@ def _universe_expanded_since_last_cycle(
     data or execution gates; it only prevents an old eight-symbol cycle from
     remaining the dashboard's last global comparison forever.
     """
-    if not cycles or not current_symbols:
+    if not last_cycle or not current_symbols:
         return False
-    raw_symbols = cycles[-1].get("symbols_evaluated")
+    raw_symbols = last_cycle.get("symbols_evaluated")
     if not isinstance(raw_symbols, (list, tuple, set, frozenset)):
         return False
     previous_symbols = {str(symbol) for symbol in raw_symbols if str(symbol)}
@@ -730,13 +733,28 @@ def _scanner_payload(scanner_result: ActiveScannerResult) -> dict[str, object]:
         "candidates": tuple(
             {
                 "symbol": item.symbol,
+                "full_asset_name": item.full_asset_name,
+                "asset_class": item.asset_class.value,
                 "bucket": item.bucket.value,
                 "decision": item.decision.value,
+                "action": item.decision.value,
                 "opportunity_score": str(item.opportunity_score),
                 "confidence": str(item.confidence),
+                "timeframe": item.timeframe.value,
+                "current_market_state": item.current_market_state.value,
+                "data_quality": item.data_quality_state.value,
+                "freshness": item.freshness,
+                "provider_provenance": item.provider_provenance,
+                # Preserve the actual reasons behind HOLD/WATCH as well as
+                # hard rejection codes; otherwise the UI shows a score with
+                # no explanation for why it was not promoted to TOP.
+                "reasons": item.major_negative_factors,
+                "risk_flags": item.risk_flags,
                 "news_sentiment": item.news_sentiment,
                 "news_relevance": str(item.news_relevance),
                 "material_event_count": item.material_event_count,
+                "headline_event_summaries": item.headline_event_summaries,
+                "news_risk_flags": item.news_risk_flags,
                 "rejection_reasons": item.rejection_reasons,
             }
             for item in scanner_result.candidates
@@ -781,15 +799,47 @@ def _news_event_digest(news_result: object, *, limit: int = 20) -> tuple[dict[st
     return tuple(digest)
 
 
-def _news_asset_contexts(news_result: object) -> dict[str, dict[str, object]]:
-    """Persist per-instrument news context without raw provider payloads."""
-    contexts = getattr(news_result, "asset_contexts", {})
+def _persistable_news_asset_contexts(
+    contexts: object,
+    *,
+    preserve_payload: bool = False,
+) -> dict[str, dict[str, object]]:
+    """Keep news evidence, but omit the implicit unavailable/neutral default.
+
+    The scanner consumes the full in-memory news result before this projection.
+    Persisting an identical empty context for every catalog instrument on every
+    poll adds no evidence and previously dominated the runtime databases.
+    """
     if not isinstance(contexts, Mapping):
         return {}
     result: dict[str, dict[str, object]] = {}
     for symbol, context in contexts.items():
         payload = context.model_dump(mode="json") if hasattr(context, "model_dump") else context
         if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("freshness") == "NEWS_SOURCE_UNAVAILABLE"
+            and payload.get("aggregate_sentiment") in (None, "NEUTRAL")
+            and not payload.get("event_summaries")
+            and not payload.get("news_risk_flags")
+            and not payload.get("latest_material_event_timestamp")
+        ):
+            try:
+                no_evidence = all(
+                    Decimal(str(payload.get(field) or 0)) == 0
+                    for field in (
+                        "aggregate_relevance",
+                        "event_risk",
+                        "unique_event_count",
+                        "material_event_count",
+                    )
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                no_evidence = False
+            if no_evidence:
+                continue
+        if preserve_payload:
+            result[str(symbol)] = dict(payload)
             continue
         result[str(symbol)] = {
             "asset_class": payload.get("asset_class"),
@@ -807,6 +857,11 @@ def _news_asset_contexts(news_result: object) -> dict[str, dict[str, object]]:
             "explanation": payload.get("explanation"),
         }
     return result
+
+
+def _news_asset_contexts(news_result: object) -> dict[str, dict[str, object]]:
+    """Persist meaningful per-instrument news context without raw payloads."""
+    return _persistable_news_asset_contexts(getattr(news_result, "asset_contexts", {}))
 
 
 def _allocation_diagnostics(

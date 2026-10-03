@@ -22,6 +22,7 @@ ALPHA_VANTAGE_PROVIDER = "ALPHA_VANTAGE"
 ALPHA_VANTAGE_NEWS_FUNCTION = "NEWS_SENTIMENT"
 ALPHA_VANTAGE_API_KEY_ENV = "ALPHA_VANTAGE_API_KEY"
 ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+MAX_NEWS_TICKER_SCOPE = 50
 
 
 class AlphaVantageNewsProvider:
@@ -62,7 +63,19 @@ class AlphaVantageNewsProvider:
 
     def set_tickers(self, tickers: tuple[str, ...]) -> None:
         """Select the ticker scope for the next read on a shared run provider."""
-        self._tickers = tickers
+        # The runtime scanner can contain the whole eToro catalog.  Keep the
+        # provider request bounded and retain crypto symbols first so the
+        # Crypto lane is not crowded out by the equity catalog.
+        normalized = tuple(dict.fromkeys(ticker.strip() for ticker in tickers if ticker.strip()))
+        crypto = tuple(
+            ticker
+            for ticker in normalized
+            if ticker.upper().startswith("CRYPTO:")
+            or ticker.upper()
+            in {"BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "LINK", "LTC", "BCH", "DOT"}
+        )
+        remainder = tuple(ticker for ticker in normalized if ticker not in crypto)
+        self._tickers = (crypto + remainder)[:MAX_NEWS_TICKER_SCOPE]
 
     def fetch_global_news(self, *, as_of: datetime) -> tuple[RawNewsItem, ...]:
         if self._api_key is None:

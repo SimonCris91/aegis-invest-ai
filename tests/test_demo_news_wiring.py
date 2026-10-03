@@ -2,7 +2,9 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.brokers.etoro import demo_execution
 from app.brokers.etoro.demo_execution import _ConfiguredDemoNewsProvider, _RunNewsSession
+from app.config.loader import load_config
 from app.domain.enums import AssetClass, Currency
 from app.domain.universe import UniversalInstrument
 from app.news.intelligence import NewsProviderError, NewsProviderStatus, RawNewsItem
@@ -146,3 +148,40 @@ def test_first_rate_limit_suppresses_later_requests() -> None:
     assert session.rate_limit_triggered is True
     assert session.provider_request_count == 1
     assert session.requests_suppressed_after_rate_limit == 1
+
+
+def test_demo_preflight_keeps_gdelt_when_alpha_vantage_is_rate_limited(monkeypatch) -> None:
+    class RateLimitedAlpha(_Provider):
+        provider_name = "ALPHA_VANTAGE"
+
+    class AvailableAlpaca(_Provider):
+        provider_name = "ALPACA_NEWS"
+
+    class AvailableGdelt(_Provider):
+        provider_name = "GDELT_DOC"
+
+    alpha = RateLimitedAlpha(
+        error=NewsProviderError("rate limited", status=NewsProviderStatus.RATE_LIMITED),
+        status=NewsProviderStatus.RATE_LIMITED,
+    )
+    alpaca = AvailableAlpaca(status=NewsProviderStatus.AVAILABLE)
+    gdelt = AvailableGdelt((_news_item(),), status=NewsProviderStatus.AVAILABLE)
+    monkeypatch.setattr(demo_execution, "AlphaVantageNewsProvider", lambda **_: alpha)
+    monkeypatch.setattr(demo_execution, "AlpacaNewsProvider", lambda **_: alpaca)
+    monkeypatch.setattr(demo_execution, "_shared_demo_gdelt_provider", lambda: gdelt)
+
+    provider = demo_execution._configured_news_provider(
+        load_config({"AEGIS_NEWS_PROVIDER": "alpha_vantage"}),
+        {
+            "AEGIS_NEWS_SECONDARY_PROVIDER": "alpaca",
+            "AEGIS_NEWS_GDELT_ENABLED": "true",
+        },
+    )
+    items = provider.fetch_global_news(as_of=NOW)
+
+    assert provider.provider_name == "ALPHA_VANTAGE_PLUS_ALPACA_PLUS_GDELT"
+    assert provider.last_status is NewsProviderStatus.PARTIAL
+    assert items == (_news_item(),)
+    assert provider.last_diagnostics["provider_statuses"]["ALPHA_VANTAGE"] == (
+        "ERROR:RATE_LIMITED"
+    )

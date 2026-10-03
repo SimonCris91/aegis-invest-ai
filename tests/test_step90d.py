@@ -241,7 +241,7 @@ def test_alpha_vantage_request_planning_and_secondary_provider_readiness() -> No
     assert readiness[1]["implemented"] is False
 
 
-def test_alpha_vantage_news_context_reaches_scanner_observationally_only() -> None:
+def test_alpha_vantage_news_context_reaches_scanner_with_bounded_source_aware_weight() -> None:
     as_of = datetime(2026, 8, 28, 16, tzinfo=UTC)
     instrument = _instrument("AAPL", AssetClass.EQUITY, "1001", as_of, display_name="Apple")
     portfolio = PortfolioSnapshot(as_of=as_of, currency=Currency.EUR, cash=Decimal("200"))
@@ -292,7 +292,11 @@ def test_alpha_vantage_news_context_reaches_scanner_observationally_only() -> No
 
     assert with_news.candidates[0].news_sentiment == "POSITIVE"
     assert with_news.candidates[0].material_event_count == 1
-    assert with_news.candidates[0].opportunity_score == baseline.candidates[0].opportunity_score
+    score_delta = (
+        with_news.candidates[0].opportunity_score
+        - baseline.candidates[0].opportunity_score
+    )
+    assert Decimal("0") < score_delta <= Decimal("0.60")
     assert with_news.candidates[0].confidence == baseline.candidates[0].confidence
     assert with_news.broker_write_calls == 0
 

@@ -6,7 +6,7 @@ import logging
 import socket
 import ssl
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -22,8 +22,11 @@ from app.brokers.etoro.auth import EtoroCredentials
 from app.brokers.etoro.client import (
     BASE,
     DEMO_AGGREGATE_PATH,
+    DEMO_CLOSE_ORDER_PATH,
     DEMO_ELIGIBILITY_PATH,
     DEMO_INSTRUMENT_BREAKDOWN_PATH,
+    DEMO_ORDER_LOOKUP_PATH,
+    DEMO_TRADE_HISTORY_PATH,
     EtoroApiError,
     EtoroReadClient,
 )
@@ -40,6 +43,7 @@ from app.brokers.etoro.http import (
     classify_transport_failure,
 )
 from app.brokers.etoro.mapping import (
+    EtoroEligibilityDenied,
     EtoroMappingError,
     map_demo_eligibility,
     map_demo_order_state,
@@ -763,6 +767,101 @@ def test_etoro_read_client_uses_demo_position_when_filled_order_row_is_absent(
     assert transport.calls[1][1] == BASE + DEMO_AGGREGATE_PATH
 
 
+def test_etoro_read_client_uses_authoritative_demo_order_lookup() -> None:
+    payload = {
+        "orderId": 382726348,
+        "status": {"id": 3, "name": "Filled", "errorCode": 0, "errorMessage": None},
+    }
+    transport = SequencedTransport([HttpResponse(200, {}, _bytes(payload))])
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"), DisciplinedHttpClient(transport)
+    )
+
+    state = client.demo_order_lookup("382726348")
+
+    assert state is ExecutionState.FILLED
+    assert transport.calls[0][1] == BASE + DEMO_ORDER_LOOKUP_PATH + "?orderId=382726348"
+
+
+def test_etoro_read_client_uses_dedicated_demo_close_order_lookup() -> None:
+    payload = {
+        "orderID": 383853986, "statusID": 3, "errorCode": 0,
+        "positions": [{"positionID": 3601673507, "amount": 4969.85}],
+    }
+    transport = SequencedTransport([HttpResponse(200, {}, _bytes(payload))])
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"), DisciplinedHttpClient(transport)
+    )
+
+    assert client.demo_close_order_position_affected("383853986", "3601673507") is True
+    assert transport.calls[0][1] == BASE + DEMO_CLOSE_ORDER_PATH + "/383853986"
+
+
+def test_etoro_close_lookup_rejects_another_position_id() -> None:
+    payload = {
+        "orderID": 383853986, "errorCode": 0,
+        "positions": [{"positionID": 3601673507}],
+    }
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"),
+        DisciplinedHttpClient(SequencedTransport([HttpResponse(200, {}, _bytes(payload))])),
+    )
+    with pytest.raises(EtoroMappingError, match="position mismatch"):
+        client.demo_close_order_position_affected("383853986", "3601673508")
+
+
+def test_etoro_closed_trade_history_matches_exact_position_and_instrument() -> None:
+    payload = [
+        {"positionId": 77, "instrumentId": 100, "netProfit": 12.5,
+         "closeTimestamp": "2026-09-25T05:17:25Z"},
+        {"positionId": 78, "instrumentId": 100, "netProfit": -2},
+    ]
+    transport = SequencedTransport([HttpResponse(200, {}, _bytes(payload))])
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"), DisciplinedHttpClient(transport)
+    )
+
+    assert client.demo_closed_trade_by_position(
+        "77", min_date=date(2026, 9, 23), instrument_id=100
+    ) == {
+        "position_id": "77",
+        "realized_pnl_account_currency": "12.5",
+        "closed_at": "2026-09-25T05:17:25+00:00",
+    }
+    assert transport.calls[0][1] == (
+        BASE + DEMO_TRADE_HISTORY_PATH + "?minDate=2026-09-23&page=1&pageSize=100"
+    )
+
+
+def test_etoro_read_client_projects_unique_demo_position_execution() -> None:
+    payload = {
+        "orderId": 382726348,
+        "status": {"name": "Filled"},
+        "positionExecutions": [
+            {
+                "state": "Open",
+                "positionId": 778899,
+                "initialExposureAccountCurrency": "12.34",
+                "gcid": "must-not-escape",
+                "accountId": 123456,
+            }
+        ],
+    }
+    transport = SequencedTransport([HttpResponse(200, {}, _bytes(payload))])
+    client = EtoroReadClient(
+        EtoroCredentials(api_key="api", user_key="user"), DisciplinedHttpClient(transport)
+    )
+
+    details = client.demo_order_lookup_details("382726348")
+
+    assert details == {
+        "state": ExecutionState.FILLED,
+        "position_executions_count": 1,
+        "position_id": "778899",
+        "executed_exposure_account_currency": "12.34",
+    }
+
+
 def test_mapping_failures_and_demo_state_semantics(now: datetime) -> None:
     identity = _identity()
     with pytest.raises(EtoroMappingError):
@@ -805,6 +904,25 @@ def test_mapping_failures_and_demo_state_semantics(now: datetime) -> None:
         map_demo_order_state(_order_state_payload("mystery"), TEST_INSTRUMENT_ID, "order-1")
         is ExecutionState.UNKNOWN
     )
+
+
+def test_demo_eligibility_explicit_broker_denial_is_not_a_mapping_failure() -> None:
+    with pytest.raises(EtoroEligibilityDenied, match="explicitly disallows opening"):
+        map_demo_eligibility(
+            {
+                "currency": "USD",
+                "notFoundInstrumentIds": [],
+                "eligibilities": [
+                    {
+                        "instrumentId": TEST_INSTRUMENT_ID,
+                        "allowOpenPosition": False,
+                        "leverageConfigs": [],
+                    }
+                ],
+            },
+            TEST_INSTRUMENT_ID,
+            "TEST",
+        )
 
 
 def test_market_observation_validation_rejects_stale_future_mismatch_and_missing_fields(
@@ -1084,7 +1202,10 @@ def test_demo_adapter_final_kill_switch_check_runs_after_reservation(
         ).submit_demo(trade, PreflightDecision(allowed=True, minimum_trade_amount=Decimal("1")))
 
     assert transport.calls == []
-    assert store.demo_submission(proposal.idempotency_key)["state"] == "RESERVED"  # type: ignore[index]
+    record = store.demo_submission(proposal.idempotency_key)
+    assert record is not None
+    assert record["state"] == "REJECTED"
+    assert record["payload"]["rejection_reason"] == "PRE_POST_SAFETY_GATE_REJECTED"
 
 
 def test_reconciliation_updates_valid_states_and_halts_unknown_or_divergent_states(

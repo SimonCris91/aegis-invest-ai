@@ -83,14 +83,48 @@ def test_managed_demo_exposure_requires_durable_amount_identity(tmp_path: Path) 
     assert store.managed_demo_exposure_eur() == Decimal("0")
     assert store.reserve_demo_submission(
         "aegis-demo-pilot:cycle:TEST:OPEN",
-        {"amount_eur": "12.50", "instrument_id": 123},
+        {"amount_eur": "12.50", "instrument_id": 123, "account_currency": "EUR"},
     )
     assert store.managed_demo_exposure_eur() == Decimal("12.50")
 
     assert store.reserve_demo_submission(
         "aegis-demo-pilot:cycle:OTHER:OPEN",
-        {"instrument_id": 456},
+        {"instrument_id": 456, "account_currency": "EUR"},
     )
+    assert store.managed_demo_exposure_eur() is None
+
+
+def test_managed_demo_exposure_reads_reconciled_usd_positions_without_fx_guessing(
+    tmp_path: Path,
+) -> None:
+    from app.domain.enums import Currency
+
+    store = SqliteRecordStore(tmp_path / "usd-exposure.sqlite3")
+    assert store.reserve_demo_submission(
+        "aegis-usd-order-123456",
+        {
+            "amount_account_currency": "500",
+            "executed_exposure_account_currency": "499.98",
+            "instrument_id": 321,
+            "account_currency": "USD",
+            "action": "OPEN",
+        },
+    )
+    store.update_demo_submission("aegis-usd-order-123456", "FILLED", {})
+
+    assert store.managed_demo_open_exposure(Currency.USD) == Decimal("499.98")
+    assert store.managed_demo_exposure(Currency.USD) == Decimal("499.98")
+    assert store.managed_demo_exposure_eur() is None
+
+
+def test_legacy_demo_order_without_currency_is_not_assumed_to_be_eur(tmp_path: Path) -> None:
+    store = SqliteRecordStore(tmp_path / "legacy-currency.sqlite3")
+    assert store.reserve_demo_submission(
+        "legacy-demo-order",
+        {"amount_eur": "87659.69", "instrument_id": 123, "action": "OPEN"},
+    )
+    store.update_demo_submission("legacy-demo-order", "FILLED", {})
+
     assert store.managed_demo_exposure_eur() is None
 
 
@@ -105,7 +139,12 @@ def _submission(
 ) -> None:
     assert store.reserve_demo_submission(
         key,
-        {"amount_eur": amount, "instrument_id": instrument_id, "action": action},
+        {
+            "amount_eur": amount,
+            "instrument_id": instrument_id,
+            "action": action,
+            "account_currency": "EUR",
+        },
     )
     store.update_demo_submission(key, state, {})
 

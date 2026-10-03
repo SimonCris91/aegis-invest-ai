@@ -9,6 +9,7 @@ from app.config.loader import ConfigLoadError, load_config, load_runtime_values
 from app.config.models import ApplicationConfig, RiskPolicyConfig, TargetAllocations
 from app.domain.enums import (
     BrokerProviderMode,
+    Currency,
     Environment,
     EtoroTransportMode,
     OperatingMode,
@@ -23,6 +24,19 @@ def test_default_config_is_demo_and_fail_closed() -> None:
     assert config.kill_switch is True
     assert config.production_trading_enabled is False
     assert config.initial_capital_eur == Decimal("200")
+
+
+def test_demo_cash_reserve_defaults_match_enabled_asset_policies() -> None:
+    from app.domain.enums import AssetClass
+    from app.policies.defaults import default_asset_policy_engine
+
+    config = ApplicationConfig()
+    policies = default_asset_policy_engine()
+
+    assert config.environment is Environment.DEMO
+    assert config.risk.min_cash_reserve == Decimal("0.07")
+    for asset_class in (AssetClass.CRYPTO, AssetClass.EQUITY, AssetClass.ETF):
+        assert policies.policy_for(asset_class).minimum_cash_reserve == config.risk.min_cash_reserve
 
 
 def test_production_environment_is_rejected_in_this_build() -> None:
@@ -117,6 +131,14 @@ def test_authorized_capital_is_optional_and_strictly_loaded() -> None:
     assert load_config({"AEGIS_AUTHORIZED_CAPITAL_EUR": "2000"}).authorized_capital_eur == Decimal(
         "2000"
     )
+    usd = load_config(
+        {
+            "AEGIS_AUTHORIZED_CAPITAL": "98000",
+            "AEGIS_AUTHORIZED_CAPITAL_CURRENCY": "USD",
+        }
+    )
+    assert usd.authorized_capital == Decimal("98000")
+    assert usd.authorized_capital_currency is Currency.USD
 
     with pytest.raises(ConfigLoadError, match="positive decimal"):
         load_config({"AEGIS_AUTHORIZED_CAPITAL_EUR": "0"})

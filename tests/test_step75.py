@@ -999,7 +999,7 @@ def test_user_demo_validation_duplicate_reservation_fails_closed(tmp_path: Path)
     store = SqliteRecordStore(tmp_path / "validation.sqlite3")
     assert store.reserve_demo_submission(
         "existing-cycle|TEST|OPEN",
-        {"instrument_id": TEST_INSTRUMENT_ID, "amount_eur": "5", "action": "OPEN"},
+        {"instrument_id": TEST_INSTRUMENT_ID, "amount_eur": "5", "action": "OPEN", "account_currency": "EUR"},
     )
 
     result = run_user_confirmed_demo_validation(
@@ -1605,12 +1605,13 @@ def test_demo_adapter_normalizes_success_and_broker_rejection(
     proposal = _proposal()
     gate, admitted = _admitted_trade(proposal, switch, now)
     transport = SequencedTransport([response])
+    store = SqliteRecordStore(tmp_path / "demo.sqlite3")
     adapter = EtoroDemoAdapter(
         credentials=EtoroCredentials(api_key="api", user_key="user"),
         http=DisciplinedHttpClient(transport),
         gate=gate,
         kill_switch=switch,
-        registry=SqliteRecordStore(tmp_path / "demo.sqlite3"),
+        registry=store,
         enabled=True,
         explicit_opt_in=True,
         clock=lambda: now,
@@ -1622,6 +1623,19 @@ def test_demo_adapter_normalizes_success_and_broker_rejection(
 
     assert result.state is expected
     assert len(transport.calls) == 1
+    record = store.demo_submission(proposal.idempotency_key)
+    assert record is not None
+    created_at = datetime.fromisoformat(str(record["payload"]["created_at"]))
+    assert created_at.tzinfo is not None
+    if expected is ExecutionState.SUBMITTED:
+        submitted_at = datetime.fromisoformat(str(record["payload"]["submitted_at"]))
+        assert submitted_at.tzinfo is not None
+    else:
+        rejected_at = datetime.fromisoformat(
+            str(record["payload"]["broker_rejected_at"])
+        )
+        assert rejected_at.tzinfo is not None
+    store.close()
 
 
 def test_http_timeout_and_ambiguous_post_activate_safe_halt(tmp_path: Path) -> None:

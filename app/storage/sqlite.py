@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from app.brokers.models import TrackRecordKind
+from app.domain.enums import Currency
 
 FORBIDDEN_KEYS = {
     "api_key",
@@ -79,6 +80,12 @@ class SqliteRecordStore:
             "CREATE TABLE IF NOT EXISTS operational_records "
             "(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
             "created_at TEXT NOT NULL, payload TEXT NOT NULL)"
+        )
+        # Status/history reads select by kind and record order. Preserve all
+        # audit rows while avoiding full table scans through unrelated events.
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operational_records_kind_id "
+            "ON operational_records(kind, id)"
         )
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS demo_submissions "
@@ -478,11 +485,15 @@ class SqliteRecordStore:
 
     def append(self, kind: str, payload: Mapping[str, object]) -> int:
         assert_secret_free(payload)
-        cursor = self._connection.execute(
-            "INSERT INTO operational_records(kind, created_at, payload) VALUES (?, ?, ?)",
-            (kind, datetime.now(UTC).isoformat(), json.dumps(payload, sort_keys=True)),
-        )
-        self._connection.commit()
+        try:
+            cursor = self._connection.execute(
+                "INSERT INTO operational_records(kind, created_at, payload) VALUES (?, ?, ?)",
+                (kind, datetime.now(UTC).isoformat(), json.dumps(payload, sort_keys=True)),
+            )
+            self._connection.commit()
+        except sqlite3.OperationalError:
+            self._connection.rollback()
+            raise
         if cursor.lastrowid is None:
             raise RuntimeError("SQLite did not return a record identifier")
         return cursor.lastrowid
@@ -502,12 +513,22 @@ class SqliteRecordStore:
         ).fetchall()
         return tuple(json.loads(row[0]) for row in rows)
 
+    def latest(self, kind: str) -> dict[str, object] | None:
+        """Read one record, without materializing an unbounded audit history."""
+        row = self._connection.execute(
+            "SELECT payload FROM operational_records WHERE kind=? ORDER BY id DESC LIMIT 1",
+            (kind,),
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
+
     @staticmethod
     def read_latest_read_only(path: Path, kind: str) -> dict[str, object] | None:
         """Read an operational record without creating or mutating the database."""
         if not path.exists():
             return None
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        connection.execute("PRAGMA busy_timeout=1000")
+        connection.execute("PRAGMA query_only=ON")
         try:
             row = connection.execute(
                 "SELECT payload FROM operational_records WHERE kind=? ORDER BY id DESC LIMIT 1",
@@ -526,7 +547,9 @@ class SqliteRecordStore:
         """Read runner lease truth without creating or mutating the SQLite store."""
         if not path.exists():
             return None
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        connection.execute("PRAGMA busy_timeout=1000")
+        connection.execute("PRAGMA query_only=ON")
         try:
             row = connection.execute(
                 "SELECT owner_token, generation, acquired_at, heartbeat_at, expires_at, "
@@ -556,7 +579,9 @@ class SqliteRecordStore:
         """Read lifecycle control without creating or mutating the store."""
         if not path.exists():
             return {"stop_requested": False, "stop_requested_at": None}
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        connection.execute("PRAGMA busy_timeout=1000")
+        connection.execute("PRAGMA query_only=ON")
         try:
             row = connection.execute(
                 "SELECT stop_requested, requested_at FROM runner_control WHERE control_name=?",
@@ -866,8 +891,33 @@ class SqliteRecordStore:
         ).fetchone()
         return 0 if row is None else int(row[0])
 
-    def managed_demo_open_exposure_eur(self) -> Decimal | None:
-        """Return current net open exposure from Aegis-owned lifecycle records."""
+    @staticmethod
+    def _demo_payload_amount(
+        payload: Mapping[str, object], currency: Currency, *, remaining: bool = False
+    ) -> Decimal:
+        if currency is Currency.USD:
+            keys = (
+                ("remaining_exposure_account_currency", "executed_exposure_account_currency", "amount_account_currency")
+                if remaining
+                else ("amount_account_currency", "executed_exposure_account_currency")
+            )
+        else:
+            keys = (
+                ("remaining_exposure_eur", "amount_account_currency", "amount_eur")
+                if remaining
+                else ("amount_account_currency", "amount_eur")
+            )
+        for key in keys:
+            raw = payload.get(key)
+            if raw is not None:
+                amount = Decimal(str(raw))
+                if amount < 0:
+                    raise InvalidOperation
+                return amount
+        raise KeyError(keys[0])
+
+    def managed_demo_open_exposure(self, currency: Currency) -> Decimal | None:
+        """Return current net open exposure in the explicitly requested currency."""
         rows = self._connection.execute(
             "SELECT state, payload FROM demo_submissions "
             "WHERE state IN ('FILLED', 'PARTIALLY_FILLED')"
@@ -876,17 +926,15 @@ class SqliteRecordStore:
         for _state, raw_payload in rows:
             try:
                 payload = json.loads(raw_payload)
-                amount = Decimal(str(payload["amount_eur"]))
-                if amount < 0:
+                if payload.get("account_currency") != currency.value:
                     return None
+                amount = self._demo_payload_amount(payload, currency)
                 instrument = str(payload["instrument_id"])
                 action = str(payload.get("action", "OPEN")).upper()
                 if payload.get("exit_status") == "CLOSED":
                     continue
                 if action in {"OPEN", "INCREASE"}:
-                    amount = Decimal(str(payload.get("remaining_exposure_eur", amount)))
-                    if amount < 0:
-                        return None
+                    amount = self._demo_payload_amount(payload, currency, remaining=True)
                     by_instrument[instrument] = by_instrument.get(instrument, Decimal("0")) + amount
                 elif action in {"REDUCE", "CLOSE"}:
                     by_instrument[instrument] = by_instrument.get(instrument, Decimal("0")) - amount
@@ -898,8 +946,8 @@ class SqliteRecordStore:
             return None
         return sum(by_instrument.values(), Decimal("0"))
 
-    def managed_demo_reserved_capital_eur(self) -> Decimal | None:
-        """Return capital reserved by unresolved Aegis Demo submissions."""
+    def managed_demo_reserved_capital(self, currency: Currency) -> Decimal | None:
+        """Return unresolved Aegis Demo reservations in the requested currency."""
         rows = self._connection.execute(
             "SELECT payload FROM demo_submissions "
             "WHERE state IN ('RESERVED', 'SUBMITTED', 'PENDING', 'UNKNOWN')"
@@ -908,18 +956,27 @@ class SqliteRecordStore:
         for (raw_payload,) in rows:
             try:
                 payload = json.loads(raw_payload)
-                amount = Decimal(str(payload["amount_eur"]))
-                if amount < 0:
+                if payload.get("account_currency") != currency.value:
                     return None
+                amount = self._demo_payload_amount(payload, currency)
             except (KeyError, TypeError, ValueError, InvalidOperation):
                 return None
             total += amount
         return total
 
-    def managed_demo_exposure_eur(self) -> Decimal | None:
-        """Return current open exposure plus unresolved submission reservations."""
-        open_exposure = self.managed_demo_open_exposure_eur()
-        reserved = self.managed_demo_reserved_capital_eur()
+    def managed_demo_exposure(self, currency: Currency) -> Decimal | None:
+        """Return open exposure plus unresolved reservations in one currency."""
+        open_exposure = self.managed_demo_open_exposure(currency)
+        reserved = self.managed_demo_reserved_capital(currency)
         if open_exposure is None or reserved is None:
             return None
         return open_exposure + reserved
+
+    def managed_demo_open_exposure_eur(self) -> Decimal | None:
+        return self.managed_demo_open_exposure(Currency.EUR)
+
+    def managed_demo_reserved_capital_eur(self) -> Decimal | None:
+        return self.managed_demo_reserved_capital(Currency.EUR)
+
+    def managed_demo_exposure_eur(self) -> Decimal | None:
+        return self.managed_demo_exposure(Currency.EUR)

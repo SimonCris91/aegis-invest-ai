@@ -431,7 +431,7 @@ def test_one_hour_weekend_closure_remains_market_closed_not_stale() -> None:
     assert freshness is IntradayFreshnessStatus.MARKET_CLOSED
 
 
-def test_one_hour_overnight_closure_remains_market_closed_not_stale() -> None:
+def test_one_hour_unknown_session_with_old_bars_is_stale_not_assumed_us_closed() -> None:
     as_of = datetime(2026, 8, 28, 8, 30, tzinfo=UTC)
     instrument = _instrument("SPY", AssetClass.ETF, "3000", as_of)
     bars = _bars(
@@ -447,6 +447,39 @@ def test_one_hour_overnight_closure_remains_market_closed_not_stale() -> None:
         bars=bars,
         as_of=as_of,
         minimum_bars=60,
+    )
+
+    assert freshness is IntradayFreshnessStatus.STALE
+
+
+def test_fresh_european_etf_is_not_discarded_by_us_hours_fallback() -> None:
+    as_of = datetime(2026, 9, 30, 7, 6, tzinfo=UTC)
+    instrument = _instrument("ZPRR.DE", AssetClass.ETF, "3001", as_of)
+    bars = _bars(
+        instrument, as_of=datetime(2026, 9, 30, 6, 0, tzinfo=UTC),
+        count=70, timeframe=TimeFrame.ONE_HOUR,
+    )
+
+    freshness = classify_intraday_freshness(
+        instrument=instrument, timeframe=TimeFrame.ONE_HOUR,
+        bars=bars, as_of=as_of, minimum_bars=60,
+    )
+
+    assert freshness is IntradayFreshnessStatus.FRESH
+
+
+def test_explicit_broker_closed_session_still_blocks_fresh_european_etf() -> None:
+    as_of = datetime(2026, 9, 30, 7, 6, tzinfo=UTC)
+    instrument = _instrument("ZPRR.DE", AssetClass.ETF, "3001", as_of)
+    instrument = instrument.model_copy(update={"tags": ("session-state:CLOSED",)})
+    bars = _bars(
+        instrument, as_of=datetime(2026, 9, 30, 6, 0, tzinfo=UTC),
+        count=70, timeframe=TimeFrame.ONE_HOUR,
+    )
+
+    freshness = classify_intraday_freshness(
+        instrument=instrument, timeframe=TimeFrame.ONE_HOUR,
+        bars=bars, as_of=as_of, minimum_bars=60,
     )
 
     assert freshness is IntradayFreshnessStatus.MARKET_CLOSED

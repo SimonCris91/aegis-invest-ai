@@ -1,12 +1,15 @@
+import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from app.brokers.models import BrokerIdentity, ExecutionState
 from app.orchestration.active_runtime import (
     ETORO_DEMO_RUNTIME_STATUS_KIND,
     EtoroDemoContinuousRunner,
+    _reconcile_unresolved_demo_submissions,
     etoro_demo_runtime_status,
     read_etoro_demo_runtime_status,
     request_etoro_demo_runtime_stop,
@@ -56,6 +59,52 @@ def test_same_cycle_is_polled_without_duplicate_submission() -> None:
     assert report["demo_broker_write_calls"] == 0
     assert report["broker_write_calls_real"] == 0
     assert sleeps == [60]
+
+
+def test_legacy_fill_reconciliation_saves_authoritative_position_id(tmp_path: Path) -> None:
+    registry = SqliteRecordStore(tmp_path / "runtime.sqlite3")
+    try:
+        key = "legacy-filled-order"
+        assert registry.reserve_demo_submission(
+            key,
+            {
+                "instrument_id": 1081,
+                "symbol": "TRX",
+                "broker_order_id": "order-123",
+                "amount": "23.04",
+            },
+        )
+        registry.update_demo_submission(key, "FILLED", {})
+
+        class OrderLookupClient:
+            def demo_order_lookup_details(self, order_id: str) -> dict[str, object]:
+                assert order_id == "order-123"
+                return {
+                    "state": ExecutionState.FILLED,
+                    "position_id": "778899",
+                    "executed_exposure_account_currency": "23.04",
+                }
+
+        report = _reconcile_unresolved_demo_submissions(
+            registry=registry,
+            client=OrderLookupClient(),  # type: ignore[arg-type]
+            identity=BrokerIdentity(stable_user_id="test-user", demo_account_id=2, real_account_id=1),
+            observed_at=datetime(2026, 9, 24, 12, tzinfo=UTC),
+        )
+
+        record = registry.demo_submission(key)
+        assert record is not None
+        payload = record["payload"]
+        assert isinstance(payload, dict)
+        assert payload["broker_position_id"] == "778899"
+        assert payload["executed_exposure_account_currency"] == "23.04"
+        assert payload["broker_reconciliation_source"] == "ETORO_V2_ORDER_LOOKUP"
+        assert payload["reconciliation"] == "verified"
+        assert report["legacy_attempted"] == 1
+        assert report["legacy_verified"] == 1
+        assert report["legacy_remaining"] == 0
+    finally:
+        registry.close()
 
 
 def test_no_cycle_never_produces_demo_post() -> None:
@@ -109,6 +158,37 @@ def test_runtime_exception_uses_bounded_backoff_then_recovers() -> None:
     assert sleeps == [17]
     assert report["last_error"] == "RuntimeError"
     assert report["broker_write_calls_real"] == 0
+
+
+def test_transient_status_lock_does_not_stop_runner(tmp_path: Path) -> None:
+    class LockedOnceStore(SqliteRecordStore):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.lock_once = True
+
+        def append(self, kind: str, payload: Mapping[str, object]) -> int:
+            if self.lock_once:
+                self.lock_once = False
+                raise sqlite3.OperationalError("database is locked")
+            return super().append(kind, payload)
+
+    store = LockedOnceStore(tmp_path / "runtime.sqlite3")
+    calls = 0
+
+    def run_once() -> Mapping[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"status": "NO_CYCLE", "cycle_id": None}
+
+    report = EtoroDemoContinuousRunner(
+        run_once=run_once,
+        sleeper=lambda _: None,
+        status_store=store,
+    ).run(max_iterations=2)
+
+    assert calls == 2
+    assert report["runner_state"] == "STOPPED"
+    assert store.list(ETORO_DEMO_RUNTIME_STATUS_KIND)
 
 
 def test_keyboard_interrupt_stops_cleanly() -> None:
@@ -251,6 +331,150 @@ def test_runner_restart_releases_lease_and_preserves_status_store(tmp_path: Path
     assert first["runner_state"] == second["runner_state"] == "STOPPED"
     assert store.runner_control_state()["lease_status"] == "RELEASED"
     assert first["broker_write_calls_real"] == second["broker_write_calls_real"] == 0
+
+
+def test_no_cycle_heartbeat_preserves_last_scan_and_write_totals(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    store = SqliteRecordStore(path)
+    results = iter(
+        (
+            {
+                "status": "BLOCKED",
+                "cycle_id": "accepted-cycle-0001",
+                "demo_broker_write_calls": 2,
+                "broker_write_calls_real": 0,
+                "news_events_received": 75,
+                "news_events_fresh": 75,
+                "news_events_material": 9,
+                "news_event_digest": ({"headline": "Latest verified event"},),
+                "package_material_diagnostics": {"TEST": "DATA_NOT_READY"},
+                "top_opportunity_count": 3,
+                "eligible_count": 2,
+            },
+            {
+                "status": "NO_CYCLE",
+                "pilot_enabled": True,
+                "news_events_received": 0,
+                "news_events_fresh": 0,
+                "news_events_material": 0,
+                "news_event_digest": (),
+                "news_provider_diagnostics": {},
+                "global_risk_context": {},
+                "top_opportunity_count": 0,
+                "eligible_count": 0,
+                "demo_exit": {"observed_at": "heartbeat", "held": 2},
+            },
+        )
+    )
+
+    EtoroDemoContinuousRunner(
+        run_once=lambda: next(results),
+        clock=FixedClock(),
+        sleeper=lambda _: None,
+        status_store=store,
+    ).run(max_iterations=2)
+
+    persisted = read_etoro_demo_runtime_status(path)
+    assert persisted is not None
+    assert persisted["cycle_state"] == "NO_CYCLE"
+    assert persisted["demo_broker_write_calls"] == 2
+    assert persisted["demo_broker_write_calls_last_poll"] == 0
+    assert persisted["last_submission_status"] == "BLOCKED"
+    assert persisted["news_events_received"] == 75
+    assert persisted["news_events_material"] == 9
+    assert persisted["news_event_digest"] == [{"headline": "Latest verified event"}]
+    assert persisted["package_material_diagnostics"] == {"TEST": "DATA_NOT_READY"}
+    assert persisted["top_opportunity_count"] == 3
+    assert persisted["eligible_demo_candidates"] == 2
+
+    # The concise status endpoint must report real persisted Demo calls,
+    # rather than hardcoding zero as if it were an account-read operation.
+    status = etoro_demo_runtime_status(path=path)
+    assert status["broker_write_calls"] == 2
+    assert status["demo_broker_write_calls_last_poll"] == 0
+
+    EtoroDemoContinuousRunner(
+        run_once=lambda: {"status": "NO_CYCLE", "pilot_enabled": True},
+        clock=FixedClock(),
+        sleeper=lambda _: None,
+        status_store=SqliteRecordStore(path),
+    ).run(max_iterations=1)
+    after_restart = read_etoro_demo_runtime_status(path)
+    assert after_restart is not None
+    assert after_restart["demo_broker_write_calls"] == 2
+    assert after_restart["news_event_digest"] == [{"headline": "Latest verified event"}]
+
+
+def test_new_cycle_does_not_retain_previous_coverage_block_reason(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    store = SqliteRecordStore(path)
+    results = iter(
+        (
+            {
+                "status": "BLOCKED",
+                "cycle_id": "coverage-blocked-cycle",
+                "a4c_reason": "INSUFFICIENT_COHERENT_MARKET_COVERAGE",
+                "blockers": ("INSUFFICIENT_COHERENT_MARKET_COVERAGE",),
+                "demo_broker_write_calls": 0,
+                "broker_write_calls_real": 0,
+            },
+            {
+                "status": "BLOCKED",
+                "cycle_id": "risk-blocked-cycle",
+                "blockers": ("RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"),
+                "scanner_reached": True,
+                "risk_manager_reached": True,
+                "demo_broker_write_calls": 0,
+                "broker_write_calls_real": 0,
+            },
+        )
+    )
+
+    EtoroDemoContinuousRunner(
+        run_once=lambda: next(results),
+        clock=FixedClock(),
+        sleeper=lambda _: None,
+        status_store=store,
+    ).run(max_iterations=2)
+
+    persisted = read_etoro_demo_runtime_status(path)
+    assert persisted is not None
+    assert persisted["scanner_reached"] is True
+    assert persisted["risk_manager_reached"] is True
+    assert persisted["blockers"] == ["RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"]
+    assert persisted["a4c_reason"] == ["RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"]
+
+
+def test_no_cycle_heartbeat_clears_legacy_coverage_reason_after_scanner_reached(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    store = SqliteRecordStore(path)
+    store.append(
+        ETORO_DEMO_RUNTIME_STATUS_KIND,
+        {
+            "runner_state": "RUNNING",
+            "cycle_state": "BLOCKED",
+            "a4c_reason": "INSUFFICIENT_COHERENT_MARKET_COVERAGE",
+            "blockers": ["RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"],
+            "scanner_reached": True,
+            "risk_manager_reached": True,
+            "observed_at": "2026-09-29T15:00:00+00:00",
+        },
+    )
+
+    EtoroDemoContinuousRunner(
+        run_once=lambda: {"status": "NO_CYCLE", "cycle_id": None},
+        clock=FixedClock(),
+        sleeper=lambda _: None,
+        status_store=store,
+    ).run(max_iterations=1)
+
+    persisted = read_etoro_demo_runtime_status(path)
+    assert persisted is not None
+    assert persisted["scanner_reached"] is True
+    assert persisted["blockers"] == ["RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"]
+    assert persisted["a4c_reason"] == ["RISK_MANAGER_REJECTED", "DEMO_PREFLIGHT_REJECTED"]
 
 
 def test_status_marks_persisted_running_with_expired_lease_as_expired(tmp_path: Path) -> None:

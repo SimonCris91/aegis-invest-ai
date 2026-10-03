@@ -20,6 +20,7 @@ ALPACA_NEWS_PROVIDER = "ALPACA_NEWS"
 ALPACA_NEWS_BASE_URL = "https://data.alpaca.markets/v1beta1/news"
 ALPACA_API_KEY_ID_ENV = "ALPACA_API_KEY_ID"
 ALPACA_API_SECRET_KEY_ENV = "ALPACA_API_SECRET_KEY"
+MAX_NEWS_SYMBOL_SCOPE = 50
 
 
 class AlpacaNewsProvider:
@@ -44,7 +45,14 @@ class AlpacaNewsProvider:
         )
         self._transport = transport or UrllibTextTransport()
         self._base_url = base_url.rstrip("/")
-        self._symbols = tuple(_alpaca_symbol(symbol) for symbol in symbols if symbol.strip())
+        self._symbols = tuple(
+            dict.fromkeys(
+                source_symbol
+                for symbol in symbols
+                if symbol.strip()
+                if (source_symbol := alpaca_news_symbol(symbol)) is not None
+            )
+        )
         self._limit = min(max(1, limit), 50)
         self._lookback_hours = min(max(1, lookback_hours), 168)
         self.read_calls = 0
@@ -61,7 +69,22 @@ class AlpacaNewsProvider:
 
     def set_tickers(self, tickers: tuple[str, ...]) -> None:
         """Match Alpha's shared-run scope API for one-shot and continuous callers."""
-        self._symbols = tuple(_alpaca_symbol(ticker) for ticker in tickers if ticker.strip())
+        normalized = tuple(dict.fromkeys(ticker.strip() for ticker in tickers if ticker.strip()))
+        crypto = tuple(
+            ticker
+            for ticker in normalized
+            if ticker.upper().startswith("CRYPTO:")
+            or ticker.upper()
+            in {"BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "LINK", "LTC", "BCH", "DOT"}
+        )
+        remainder = tuple(ticker for ticker in normalized if ticker not in crypto)
+        self._symbols = tuple(
+            dict.fromkeys(
+                source_symbol
+                for ticker in (crypto + remainder)[:MAX_NEWS_SYMBOL_SCOPE]
+                if (source_symbol := alpaca_news_symbol(ticker)) is not None
+            )
+        )
 
     def fetch_global_news(self, *, as_of: datetime) -> tuple[RawNewsItem, ...]:
         self.read_calls += 1
@@ -193,13 +216,15 @@ def _parse_article(raw: dict[str, Any]) -> RawNewsItem | None:
         published_at = datetime.fromisoformat(str(published).replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+    raw_symbols = raw.get("symbols", ())
+    if not isinstance(raw_symbols, (list, tuple)):
+        raw_symbols = ()
     symbols = tuple(
         str(symbol).strip().upper()
-        for symbol in raw.get("symbols", ())
-        if str(symbol).strip()
+        for symbol in raw_symbols
+        if isinstance(symbol, str) and symbol.strip()
     )
     summary = _text(raw.get("summary")) or _text(raw.get("content"))
-    symbol_text = " ".join(symbols)
     return RawNewsItem(
         headline=headline,
         source=source,
@@ -207,16 +232,45 @@ def _parse_article(raw: dict[str, Any]) -> RawNewsItem | None:
         url_or_reference=_text(raw.get("url")) or _text(raw.get("id")),
         language="en",
         geographic_scope="GLOBAL",
-        summary=f"{summary or ''} {symbol_text}".strip() or None,
+        summary=summary,
+        provider_symbols=tuple(dict.fromkeys(symbols)),
         source_quality=NewsSourceQuality.MAJOR_FINANCIAL_NEWS,
         provider=ALPACA_NEWS_PROVIDER,
     )
 
 
-def _alpaca_symbol(symbol: str) -> str:
+def alpaca_news_symbol(symbol: str) -> str | None:
+    """Return an Alpaca News ticker for a supported eToro symbol.
+
+    eToro appends ``.RTH`` to some US listings as a session marker; it is not
+    part of the ticker Alpaca indexes. Other exchange suffixes are preserved
+    as unsupported instead of being stripped into a potentially different US
+    security.
+    """
     raw = symbol.strip().upper()
     if raw.startswith("CRYPTO:"):
-        return f"{raw.split(':', 1)[1]}USD"
+        raw = raw.split(":", 1)[1]
+        # Broker cross-currency pairs are not USD coin tickers. Appending USD
+        # to LTCJPY/LTCNZD invents symbols that this news feed never indexes.
+        if any(
+            raw.endswith(quote) and len(raw) > len(quote)
+            for quote in (
+                "JPY",
+                "NZD",
+                "EUR",
+                "GBP",
+                "AUD",
+                "CAD",
+                "CHF",
+            )
+        ):
+            return None
+        if not raw.endswith("USD"):
+            raw = f"{raw}USD"
+    elif raw.endswith(".RTH"):
+        raw = raw[:-4]
+    if not raw or not all("A" <= char <= "Z" or "0" <= char <= "9" or char == "-" for char in raw):
+        return None
     return raw
 
 

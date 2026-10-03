@@ -1,10 +1,11 @@
 """Authenticated eToro reads using only documented official routes."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from time import time_ns
 from typing import NoReturn
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from app.brokers.etoro.auth import EtoroCredentials
 from app.brokers.etoro.http import (
@@ -19,6 +20,7 @@ from app.brokers.etoro.mapping import (
     SAFE_CLASSIFICATION_FIELDS,
     EtoroMappingError,
     map_demo_eligibility,
+    map_demo_order_lookup_state,
     map_demo_order_state,
     map_demo_portfolio,
     map_identity,
@@ -43,8 +45,12 @@ BASE = "https://public-api.etoro.com"
 IDENTITY_PATH = "/api/v1/me"
 DEMO_PORTFOLIO_PATH = "/api/v1/trading/info/demo/portfolio"
 DEMO_AGGREGATE_PATH = "/api/v1/trading/info/demo/aggregate-portfolio"
+DEMO_PNL_PATH = "/api/v1/trading/info/demo/pnl"
 DEMO_ELIGIBILITY_PATH = "/api/v2/trading/info/demo/eligibility"
 DEMO_INSTRUMENT_BREAKDOWN_PATH = "/api/v2/trading/info/demo/instrument-breakdown"
+DEMO_ORDER_LOOKUP_PATH = "/api/v2/trading/info/demo/orders:lookup"
+DEMO_CLOSE_ORDER_PATH = "/api/v1/trading/info/demo/close-orders"
+DEMO_TRADE_HISTORY_PATH = "/api/v1/trading/info/trade/demo/history"
 REAL_PORTFOLIO_PATH = "/api/v1/trading/info/portfolio"
 RATES_PATH = "/api/v1/market-data/instruments/rates"
 SEARCH_PATH = "/api/v1/market-data/search"
@@ -54,6 +60,10 @@ CANDLE_HISTORY_PATH = (
     "/api/v1/market-data/instruments/"
     "{instrument_id}/history/candles/{direction}/{interval}/{candles_count}"
 )
+PUBLIC_PORTFOLIO_GAIN_PATH = "/api/v2/portfolios/{username}/gain/{granularity}"
+PUBLIC_PORTFOLIO_COPIERS_PATH = "/api/v2/portfolios/{username}/copiers"
+PUBLIC_PORTFOLIO_ASSETS_PATH = "/api/v2/portfolios/{username}/assets/history"
+PUBLIC_PORTFOLIO_EXPOSURE_PATH = "/api/v2/portfolios/{username}/exposure/history"
 UNIVERSAL_SEARCH_FIELDS = ",".join(
     (
         "instrumentId",
@@ -185,6 +195,10 @@ class EtoroReadClient:
 
     def demo_portfolio_payload(self) -> object:
         return self._get(DEMO_PORTFOLIO_PATH)
+
+    def demo_pnl_payload(self) -> object:
+        """Return documented per-position Demo P/L and broker position IDs."""
+        return self._get(DEMO_PNL_PATH)
 
     def real_portfolio_read_only(
         self, symbols: dict[int, str], *, currency: Currency = Currency.USD
@@ -324,6 +338,28 @@ class EtoroReadClient:
     def instrument_display_data(self) -> object:
         """Read the unfiltered official instrument display catalog."""
         return self._get(INSTRUMENTS_PATH)
+
+    def public_portfolio_gain(
+        self, username: str, *, granularity: str = "monthly", count: int = 60
+    ) -> object:
+        """Read a public profile's return history; this endpoint never writes."""
+        path = _public_profile_path(PUBLIC_PORTFOLIO_GAIN_PATH, username, granularity=granularity)
+        query = urlencode({"count": str(count)})
+        return self._get(f"{path}?{query}")
+
+    def public_portfolio_copiers(self, username: str) -> object:
+        """Read public copier statistics for one profile."""
+        return self._get(_public_profile_path(PUBLIC_PORTFOLIO_COPIERS_PATH, username))
+
+    def public_portfolio_assets(self, username: str, *, period: str = "LastTwoYears") -> object:
+        """Read public asset allocation history for one profile."""
+        path = _public_profile_path(PUBLIC_PORTFOLIO_ASSETS_PATH, username)
+        return self._get(f"{path}?{urlencode({'period': period})}")
+
+    def public_portfolio_exposure(self, username: str, *, period: str = "LastTwoYears") -> object:
+        """Read public exposure history for one profile."""
+        path = _public_profile_path(PUBLIC_PORTFOLIO_EXPOSURE_PATH, username)
+        return self._get(f"{path}?{urlencode({'period': period})}")
 
     def instrument_type_names(self) -> dict[int, str]:
         raw = self._get(INSTRUMENT_TYPES_PATH)
@@ -483,6 +519,136 @@ class EtoroReadClient:
                 endpoint=DEMO_INSTRUMENT_BREAKDOWN_PATH,
             ) from exc
 
+    def demo_order_lookup(
+        self, order_id: str, *, reference_id: str | None = None
+    ) -> ExecutionState:
+        """Read one Demo order through eToro's order-level lookup endpoint.
+
+        This is read-only and intentionally separate from instrument-breakdown:
+        a filled order can disappear from the active instrument view while its
+        authoritative order record remains queryable here.
+        """
+        details = self.demo_order_lookup_details(order_id, reference_id=reference_id)
+        state = details["state"]
+        if not isinstance(state, ExecutionState):
+            raise EtoroMappingError("Demo order lookup state is invalid")
+        return state
+
+    def demo_close_order_position_affected(
+        self, order_id: str, position_id: str
+    ) -> bool:
+        """Verify a Demo close order against its exact position, read-only.
+
+        Close-order IDs are not served by the open-order ``orders:lookup``
+        endpoint.  A response without the expected position is not evidence
+        of execution; callers must not use it to replay a close.
+        """
+        if not order_id.isdigit() or not position_id.isdigit():
+            raise ValueError("numeric close order and position IDs are required")
+        raw = self._get(f"{DEMO_CLOSE_ORDER_PATH}/{order_id}")
+        if not isinstance(raw, dict) or str(raw.get("orderID")) != order_id:
+            raise EtoroMappingError("Demo close-order identity mismatch")
+        positions = raw.get("positions")
+        if not isinstance(positions, list):
+            raise EtoroMappingError("Demo close-order positions unavailable")
+        observed_ids = {
+            str(row.get("positionID")) for row in positions if isinstance(row, dict)
+        }
+        if observed_ids and position_id not in observed_ids:
+            raise EtoroMappingError("Demo close-order position mismatch")
+        if raw.get("errorCode") not in (None, 0, "0"):
+            return False
+        return position_id in observed_ids
+
+    def demo_closed_trade_by_position(
+        self, position_id: str, *, min_date: date, instrument_id: int
+    ) -> dict[str, str] | None:
+        """Find an exact closed Demo position in bounded broker history."""
+        if not position_id.isdigit() or instrument_id <= 0:
+            raise ValueError("valid position and instrument IDs are required")
+        matches: list[dict[str, object]] = []
+        for page in range(1, 6):
+            query = urlencode({"minDate": min_date.isoformat(), "page": page, "pageSize": 100})
+            raw = self._get(f"{DEMO_TRADE_HISTORY_PATH}?{query}")
+            if not isinstance(raw, list):
+                raise EtoroMappingError("Demo trading history is not a list")
+            matches.extend(
+                row for row in raw
+                if isinstance(row, dict)
+                and str(row.get("positionId")) == position_id
+                and str(row.get("instrumentId")) == str(instrument_id)
+            )
+            if len(matches) > 1:
+                raise EtoroMappingError("Demo position has ambiguous history rows")
+            if len(raw) < 100:
+                break
+        if not matches:
+            return None
+        row = matches[0]
+        result = {"position_id": position_id}
+        try:
+            profit = Decimal(str(row.get("netProfit")))
+        except (InvalidOperation, TypeError, ValueError):
+            profit = None
+        if profit is not None and profit.is_finite():
+            result["realized_pnl_account_currency"] = str(profit)
+        timestamp = row.get("closeTimestamp")
+        if isinstance(timestamp, str):
+            try:
+                closed_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                closed_at = None
+            if closed_at is not None and closed_at.tzinfo is not None:
+                result["closed_at"] = closed_at.isoformat()
+        return result
+
+    def demo_order_lookup_details(
+        self, order_id: str, *, reference_id: str | None = None
+    ) -> dict[str, object]:
+        """Return only safe state and uniquely attributable open-position data.
+
+        eToro's official order lookup includes per-order position executions.
+        Keep account/customer identifiers out of the returned projection and
+        expose a position ID only when exactly one open execution is present.
+        """
+        if (not order_id and not reference_id) or (order_id and reference_id):
+            raise ValueError("provide exactly one of order_id or reference_id")
+        identifier = {"referenceId": reference_id} if reference_id else {"orderId": order_id}
+        path = f"{DEMO_ORDER_LOOKUP_PATH}?{urlencode(identifier)}"
+        raw = self._get(path)
+        if not isinstance(raw, dict):
+            raise EtoroMappingError("Demo order lookup payload must be an object")
+        state = map_demo_order_lookup_state(raw, order_id)
+        result: dict[str, object] = {
+            "state": state,
+            "position_executions_count": 0,
+        }
+        raw_executions = raw.get("positionExecutions")
+        if not isinstance(raw_executions, list):
+            return result
+        open_executions = [
+            row
+            for row in raw_executions
+            if isinstance(row, dict)
+            and str(row.get("state", "")).casefold() in {"open", "opened"}
+            and str(row.get("positionId", "")).isdigit()
+        ]
+        result["position_executions_count"] = len(raw_executions)
+        if state is not ExecutionState.FILLED or len(open_executions) != 1:
+            return result
+        execution = open_executions[0]
+        result["position_id"] = str(execution["positionId"])
+        exposure = execution.get("initialExposureAccountCurrency")
+        if exposure is None:
+            exposure = execution.get("investedAmountCurrency")
+        try:
+            parsed_exposure = Decimal(str(exposure))
+        except (InvalidOperation, TypeError, ValueError):
+            return result
+        if parsed_exposure.is_finite() and parsed_exposure > 0:
+            result["executed_exposure_account_currency"] = str(parsed_exposure)
+        return result
+
     @staticmethod
     def _raise_response_error(response: HttpResponse, endpoint: str, operation: str) -> None:
         category = classify_http_failure(response)
@@ -516,6 +682,16 @@ def _has_instrument_breakdown(raw: object, instrument_id: int) -> bool:
         isinstance(item, dict) and item.get("instrumentId") == instrument_id
         for item in instruments
     )
+
+
+def _public_profile_path(template: str, username: str, **values: str) -> str:
+    if not isinstance(username, str) or not username or len(username) > 50:
+        raise ValueError("public eToro username is invalid")
+    if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in username):
+        raise ValueError("public eToro username is invalid")
+    if "granularity" in values and values["granularity"] not in {"daily", "monthly", "yearly"}:
+        raise ValueError("public gain granularity is invalid")
+    return template.format(username=quote(username, safe=""), **values)
 
 
 def _extract_instrument_metadata(raw: object) -> dict[int, dict[str, object]]:

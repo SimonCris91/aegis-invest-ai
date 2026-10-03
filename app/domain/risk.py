@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import Field, field_validator, model_validator
 
 from app.domain.base import FrozenDomainModel, require_aware
-from app.domain.enums import RiskDecisionStatus, RiskViolationCode
+from app.domain.enums import Currency, RiskDecisionStatus, RiskViolationCode
 from app.domain.market import InstrumentMetadata, PriceSnapshot
 from app.domain.portfolio import PortfolioSnapshot
 from app.domain.proposals import TradeProposal
@@ -16,6 +16,7 @@ from app.domain.proposals import TradeProposal
 class AuthorizedCapitalEnvelope(FrozenDomainModel):
     """User permission boundary, distinct from broker account capacity."""
 
+    currency: Currency = Currency.EUR
     authorized_capital_eur: Decimal = Field(gt=0)
     managed_exposure_eur: Decimal | None = Field(default=None, ge=0)
     reserved_capital_eur: Decimal = Field(default=Decimal("0"), ge=0)

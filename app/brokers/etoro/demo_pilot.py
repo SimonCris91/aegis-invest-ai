@@ -1,7 +1,7 @@
 """Automatic eToro Demo pilot guards for accepted A4C cycles."""
 
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Protocol
@@ -19,7 +19,7 @@ from app.brokers.etoro.http import DisciplinedHttpClient
 from app.brokers.models import BrokerSubmission, ExecutionState, PreflightDecision
 from app.brokers.reconciliation import ReconciliationError, reconcile_demo_state
 from app.domain.base import FrozenDomainModel
-from app.domain.enums import OperatingMode, RiskDecisionStatus
+from app.domain.enums import AssetClass, Currency, OperatingMode, RiskDecisionStatus
 from app.domain.proposals import TradeProposal
 from app.domain.risk import RiskContext
 from app.execution.gate import AuthorizationAlreadyConsumedError, RiskEnforcedExecutionGate
@@ -44,6 +44,7 @@ class EtoroDemoPilotBlocker(StrEnum):
     NON_TOP_OPPORTUNITY = "NON_TOP_OPPORTUNITY"
     AMBIGUOUS_INSTRUMENT_MAPPING = "AMBIGUOUS_INSTRUMENT_MAPPING"
     DUPLICATE_CYCLE_CANDIDATE = "DUPLICATE_CYCLE_CANDIDATE"
+    UNRESOLVED_INSTRUMENT_SUBMISSION = "UNRESOLVED_INSTRUMENT_SUBMISSION"
     SUBMISSION_GATEWAY_UNAVAILABLE = "SUBMISSION_GATEWAY_UNAVAILABLE"
     VERIFIED_EXECUTION_MATERIAL_UNAVAILABLE = "VERIFIED_EXECUTION_MATERIAL_UNAVAILABLE"
     RISK_MANAGER_REJECTED = "RISK_MANAGER_REJECTED"
@@ -71,6 +72,8 @@ class EtoroDemoOrderIntent(FrozenDomainModel):
 
 class EtoroDemoSubmissionOutcome(FrozenDomainModel):
     submitted: bool
+    symbol: str | None = None
+    asset_class: str | None = None
     broker_order_id: str | None = Field(default=None, min_length=1)
     broker_reference_id: str | None = Field(default=None, min_length=1)
     sanitized_status: str = Field(min_length=1)
@@ -114,6 +117,46 @@ class DemoSubmissionReadback(Protocol):
     def demo_order_state(self, instrument_id: int, order_id: str) -> ExecutionState: ...
 
 
+def _diversified_candidate_order(
+    candidates: tuple[ActiveScannerCandidate, ...],
+) -> tuple[ActiveScannerCandidate, ...]:
+    """Keep execution lanes from starving non-crypto asset classes.
+
+    Ranking remains the score inside each class, but the order lane takes one
+    candidate per supported class before taking a second candidate. This makes
+    the Demo pilot evaluate equities and ETFs when they are present and
+    package-ready, instead of silently spending every cycle on crypto.
+    """
+    if len(candidates) < 2:
+        return candidates
+    by_class: dict[str, list[ActiveScannerCandidate]] = {}
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.opportunity_score, item.confidence),
+        reverse=True,
+    ):
+        by_class.setdefault(candidate.asset_class.value, []).append(candidate)
+    class_order = [asset_class.value for asset_class in (
+        AssetClass.EQUITY,
+        AssetClass.ETF,
+        AssetClass.CRYPTO,
+    ) if asset_class.value in by_class]
+    class_order.extend(sorted(key for key in by_class if key not in class_order))
+    ordered: list[ActiveScannerCandidate] = []
+    index = 0
+    while class_order:
+        next_order: list[str] = []
+        for asset_class in class_order:
+            bucket = by_class[asset_class]
+            if index < len(bucket):
+                ordered.append(bucket[index])
+            if index + 1 < len(bucket):
+                next_order.append(asset_class)
+        class_order = next_order
+        index += 1
+    return tuple(ordered)
+
+
 class RiskCheckedEtoroDemoSubmissionGateway:
     """Risk/admission checked gateway into the existing eToro Demo adapter."""
 
@@ -129,6 +172,7 @@ class RiskCheckedEtoroDemoSubmissionGateway:
         registry: SqliteRecordStore,
         readback: DemoSubmissionReadback | None = None,
         tradability_revalidator: Callable[[int, str, datetime], bool] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._environment = environment
         self._credentials = credentials
@@ -139,6 +183,7 @@ class RiskCheckedEtoroDemoSubmissionGateway:
         self._registry = registry
         self._readback = readback
         self._tradability_revalidator = tradability_revalidator
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def submit_demo_order(
         self,
@@ -187,7 +232,7 @@ class RiskCheckedEtoroDemoSubmissionGateway:
             authorized = self._gate.admit(
                 approved_proposal,
                 evaluation.authorization,
-                at=package.risk_context.evaluated_at,
+                at=self._clock(),
             )
         except (AuthorizationAlreadyConsumedError, PermissionError, RiskAuthorizationError):
             return _submission_outcome(
@@ -203,7 +248,7 @@ class RiskCheckedEtoroDemoSubmissionGateway:
             registry=self._registry,
             enabled=True,
             explicit_opt_in=True,
-            clock=lambda: package.risk_context.evaluated_at,
+            clock=self._clock,
             tradability_revalidator=self._tradability_revalidator,
         )
         try:
@@ -267,8 +312,14 @@ class RiskCheckedEtoroDemoSubmissionGateway:
         )
 
 
-def demo_pilot_settings(values: Mapping[str, str]) -> EtoroDemoPilotSettings:
-    raw = values.get("AEGIS_ETORO_DEMO_PILOT_NOTIONAL_EUR")
+def demo_pilot_settings(
+    values: Mapping[str, str], *, currency: Currency = Currency.EUR
+) -> EtoroDemoPilotSettings:
+    raw = values.get("AEGIS_ETORO_DEMO_PILOT_NOTIONAL")
+    if raw is None:
+        raw = values.get(f"AEGIS_ETORO_DEMO_PILOT_NOTIONAL_{currency.value}")
+    if raw is None and currency is Currency.EUR:
+        raw = values.get("AEGIS_ETORO_DEMO_PILOT_NOTIONAL_EUR")
     if raw is None or not raw.strip():
         return EtoroDemoPilotSettings(enabled=False, notional_eur=None)
     try:
@@ -315,22 +366,16 @@ class EtoroAutomaticDemoPilot:
             # Demo-only smoke lane: let one coherent WATCHLIST candidate reach
             # the normal RiskManager/preflight gates.  This fixes the historic
             # zero-order dead end without relabelling the candidate as TOP.
-            top = tuple(
-                sorted(
-                    scanner_result.watchlist,
-                    key=lambda candidate: (
-                        candidate.asset_class.value == "CRYPTO",
-                        candidate.opportunity_score,
-                        candidate.confidence,
-                    ),
-                    reverse=True,
-                )
-            )
+            top = _diversified_candidate_order(tuple(scanner_result.watchlist))
+        else:
+            top = _diversified_candidate_order(top)
         if not top:
             return EtoroDemoPilotResult(
                 status=EtoroDemoPilotStatus.NO_TOP_OPPORTUNITY,
                 cycle_id=cycle.cycle_id,
             )
+        if not self._settings.enabled or self._settings.notional_eur is None:
+            return _blocked(cycle, EtoroDemoPilotBlocker.MISSING_PILOT_NOTIONAL)
         if submission_packages is not None:
             # Package construction performs live broker reads and can fail for
             # one symbol while succeeding for another.  Do not let the first
@@ -341,26 +386,45 @@ class EtoroAutomaticDemoPilot:
             if not package_ready and not exploratory_watchlist:
                 package_ready = tuple(
                     candidate
-                    for candidate in sorted(
-                        scanner_result.watchlist,
-                        key=lambda candidate: (
-                            candidate.asset_class.value == "CRYPTO",
-                            candidate.opportunity_score,
-                            candidate.confidence,
-                        ),
-                        reverse=True,
-                    )
+                    for candidate in _diversified_candidate_order(tuple(scanner_result.watchlist))
                     if candidate.symbol in submission_packages
                 )
             if package_ready:
                 top = package_ready
-        if submission_packages is None and (
-            not self._settings.enabled or self._settings.notional_eur is None
-        ):
-            return _blocked(cycle, EtoroDemoPilotBlocker.MISSING_PILOT_NOTIONAL)
+            else:
+                # Preserve actionable validation failures (for example an
+                # ambiguous eToro mapping) instead of masking them with the
+                # later missing-package summary. Only report unavailable
+                # execution material when at least one candidate is otherwise
+                # a valid Demo intent.
+                valid_intent_exists = False
+                specific_blockers: list[EtoroDemoPilotBlocker] = []
+                for candidate in top:
+                    diagnostic = self._intent_for(
+                        cycle=cycle,
+                        candidate=candidate,
+                        broker_instrument_ids=broker_instrument_ids,
+                        package=None,
+                        allow_exploratory_watchlist=allow_exploratory_watchlist,
+                    )
+                    if isinstance(diagnostic, EtoroDemoPilotBlocker):
+                        specific_blockers.append(diagnostic)
+                    else:
+                        valid_intent_exists = True
+                if specific_blockers and not valid_intent_exists:
+                    return _blocked(cycle, specific_blockers[0])
+                # Never create a nominal intent from the configured exposure
+                # limit when live quote, eligibility, cash sizing, or preflight
+                # material is missing. That produced misleading 98k intents
+                # which could only fail later at the gateway.
+                return _blocked(
+                    cycle,
+                    EtoroDemoPilotBlocker.VERIFIED_EXECUTION_MATERIAL_UNAVAILABLE,
+                )
 
         intents: list[EtoroDemoOrderIntent] = []
         blockers: list[EtoroDemoPilotBlocker] = []
+        unresolved_instrument_ids = _unresolved_instrument_ids(self._registry)
         for candidate in top:
             intent = self._intent_for(
                 cycle=cycle,
@@ -378,6 +442,9 @@ class EtoroAutomaticDemoPilot:
                 continue
             if self._registry.demo_submission(intent.idempotency_key) is not None:
                 blockers.append(EtoroDemoPilotBlocker.DUPLICATE_CYCLE_CANDIDATE)
+                continue
+            if intent.broker_instrument_id in unresolved_instrument_ids:
+                blockers.append(EtoroDemoPilotBlocker.UNRESOLVED_INSTRUMENT_SUBMISSION)
                 continue
             intents.append(intent)
         if blockers and not (exploratory_watchlist and intents):
@@ -400,7 +467,9 @@ class EtoroAutomaticDemoPilot:
             package = (
                 None if submission_packages is None else submission_packages.get(intent.symbol)
             )
-            outcome = self._gateway.submit_demo_order(intent, package=package)
+            outcome = self._gateway.submit_demo_order(intent, package=package).model_copy(
+                update={"symbol": intent.symbol, "asset_class": intent.asset_class}
+            )
             submissions.append(outcome)
             if not outcome.submitted:
                 blocker = _submission_blocker(outcome.sanitized_status)
@@ -551,6 +620,22 @@ def _submission_blocker(status: str) -> EtoroDemoPilotBlocker:
         ),
     }
     return mapping.get(status, EtoroDemoPilotBlocker.DEMO_SUBMISSION_FAILED)
+
+
+def _unresolved_instrument_ids(registry: SqliteRecordStore) -> frozenset[int]:
+    """Prevent a new entry while an earlier entry for the same instrument is unresolved."""
+    instrument_ids: set[int] = set()
+    for record in registry.unresolved_demo_submissions():
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        try:
+            instrument_id = int(payload["instrument_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if instrument_id > 0:
+            instrument_ids.add(instrument_id)
+    return frozenset(instrument_ids)
 
 
 def _package_matches_intent(

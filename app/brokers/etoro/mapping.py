@@ -49,6 +49,10 @@ class EtoroMappingError(ValueError):
     pass
 
 
+class EtoroEligibilityDenied(EtoroMappingError):
+    """The broker returned a valid instrument record that explicitly forbids opening."""
+
+
 def map_identity(raw: object) -> BrokerIdentity:
     if not isinstance(raw, dict):
         raise EtoroMappingError("identity payload must be an object")
@@ -537,6 +541,9 @@ def map_demo_eligibility(raw: object, instrument_id: int, symbol: str) -> DemoEl
             raise EtoroMappingError("instrument is not known to Demo eligibility")
         items = raw["eligibilities"]
         item = next(value for value in items if int(value["instrumentId"]) == instrument_id)
+        allow_open = _required_bool(item, "allowOpenPosition")
+        if not allow_open:
+            raise EtoroEligibilityDenied("broker explicitly disallows opening this instrument")
         configs = item["leverageConfigs"]
         config = next(
             value
@@ -555,7 +562,7 @@ def map_demo_eligibility(raw: object, instrument_id: int, symbol: str) -> DemoEl
             symbol=symbol,
             currency=Currency(str(raw["currency"]).upper()),
             minimum_position=minimum,
-            allow_open=_required_bool(item, "allowOpenPosition"),
+            allow_open=allow_open,
             allow_close=_optional_bool(item, "allowClosePosition"),
             max_units_per_order=_optional_decimal(item, "maxUnitsPerOrder"),
             allowed_order_quantity_types=_optional_str_tuple(item, "allowedOrderQuantityType"),
@@ -588,6 +595,42 @@ def map_demo_order_state(raw: object, instrument_id: int, order_id: str) -> Exec
         "filled": ExecutionState.FILLED,
         "partiallyfilled": ExecutionState.PARTIALLY_FILLED,
         "rejected": ExecutionState.REJECTED,
+        "cancelled": ExecutionState.CANCELLED,
+        "canceled": ExecutionState.CANCELLED,
+    }
+    return states.get(normalized, ExecutionState.UNKNOWN)
+
+
+def map_demo_order_lookup_state(raw: object, order_id: str) -> ExecutionState:
+    """Map the authoritative eToro order lookup response to a lifecycle state.
+
+    The lookup endpoint is the broker's order-level source of truth.  Keep this
+    mapper deliberately fail-closed: an omitted or unfamiliar status must not
+    be interpreted as a rejection or a fill.
+    """
+    if not isinstance(raw, dict):
+        raise EtoroMappingError("Demo order lookup payload must be an object")
+    returned_order_id = raw.get("orderId")
+    if order_id and returned_order_id is not None and str(returned_order_id) != str(order_id):
+        raise EtoroMappingError("Demo order lookup returned a different order")
+    status = raw.get("status")
+    if isinstance(status, dict):
+        status_value = status.get("name")
+    else:
+        status_value = status
+    if not isinstance(status_value, str):
+        return ExecutionState.UNKNOWN
+    normalized = status_value.replace("_", "").replace("-", "").replace(" ", "").casefold()
+    states = {
+        "received": ExecutionState.SUBMITTED,
+        "submitted": ExecutionState.SUBMITTED,
+        "accepted": ExecutionState.SUBMITTED,
+        "processing": ExecutionState.PENDING,
+        "pending": ExecutionState.PENDING,
+        "partiallyfilled": ExecutionState.PARTIALLY_FILLED,
+        "filled": ExecutionState.FILLED,
+        "rejected": ExecutionState.REJECTED,
+        "failed": ExecutionState.REJECTED,
         "cancelled": ExecutionState.CANCELLED,
         "canceled": ExecutionState.CANCELLED,
     }

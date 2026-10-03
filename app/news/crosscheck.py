@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from datetime import datetime
+from time import monotonic
 
 from app.news.intelligence import (
     GlobalNewsProvider,
@@ -15,16 +16,26 @@ from app.news.intelligence import (
 
 
 class CrossCheckedNewsProvider:
-    """Combine two independent feeds while preserving each source's status."""
+    """Combine independent feeds while preserving each source's status."""
 
-    provider_name = "ALPHA_VANTAGE_PLUS_ALPACA"
-
-    def __init__(self, primary: GlobalNewsProvider, secondary: GlobalNewsProvider) -> None:
-        self._primary = primary
-        self._secondary = secondary
+    def __init__(
+        self,
+        primary: GlobalNewsProvider,
+        secondary: GlobalNewsProvider,
+        *additional: GlobalNewsProvider,
+    ) -> None:
+        self._providers = (primary, secondary, *additional)
+        self._provider_name = "_PLUS_".join(
+            _provider_label(provider) for provider in self._providers
+        )
         self.read_calls = 0
         self._last_status = NewsProviderStatus.PROVIDER_UNAVAILABLE
         self._last_diagnostics: dict[str, object] = {}
+        self._rate_limit_until: dict[str, float] = {}
+
+    @property
+    def provider_name(self) -> str:
+        return self._provider_name
 
     @property
     def last_status(self) -> NewsProviderStatus:
@@ -35,7 +46,7 @@ class CrossCheckedNewsProvider:
         return dict(self._last_diagnostics)
 
     def set_tickers(self, tickers: tuple[str, ...]) -> None:
-        for provider in (self._primary, self._secondary):
+        for provider in self._providers:
             setter = getattr(provider, "set_tickers", None)
             if callable(setter):
                 setter(tickers)
@@ -44,12 +55,44 @@ class CrossCheckedNewsProvider:
         self.read_calls += 1
         results: dict[str, tuple[RawNewsItem, ...]] = {}
         errors: dict[str, NewsProviderError] = {}
-        for provider in (self._primary, self._secondary):
+        suppressed: set[str] = set()
+        for provider in self._providers:
             name = str(getattr(provider, "provider_name", type(provider).__name__))
+            now = monotonic()
+            retry_at = self._rate_limit_until.get(name, 0.0)
+            if now < retry_at:
+                suppressed.add(name)
+                errors[name] = NewsProviderError(
+                    "news provider is in rate-limit cooldown",
+                    status=NewsProviderStatus.RATE_LIMITED,
+                    retry_after=str(max(1, int(retry_at - now))),
+                )
+                continue
+            self._rate_limit_until.pop(name, None)
             try:
                 results[name] = tuple(provider.fetch_global_news(as_of=as_of))
             except NewsProviderError as exc:
                 errors[name] = exc
+                if exc.status is NewsProviderStatus.RATE_LIMITED:
+                    try:
+                        retry_after = int(exc.retry_after or "")
+                    except ValueError:
+                        retry_after = 300
+                    # Bound provider-supplied cooldowns; a malformed header
+                    # cannot disable a source indefinitely.
+                    self._rate_limit_until[name] = monotonic() + min(
+                        900, max(30, retry_after)
+                    )
+
+        source_statuses = {
+            name: (
+                errors[name].status.value
+                if name in errors
+                else getattr(getattr(provider, "last_status", None), "value", "AVAILABLE")
+            )
+            for provider in self._providers
+            if (name := str(getattr(provider, "provider_name", type(provider).__name__)))
+        }
 
         if not results:
             error = next(iter(errors.values()), NewsProviderError(
@@ -57,21 +100,27 @@ class CrossCheckedNewsProvider:
                 status=NewsProviderStatus.PROVIDER_UNAVAILABLE,
             ))
             self._last_status = error.status
-            self._last_diagnostics = self._diagnostics(results, errors)
+            self._last_diagnostics = self._diagnostics(
+                results, errors, source_statuses=source_statuses, suppressed=suppressed
+            )
             raise error
 
         merged = tuple(item for items in results.values() for item in items)
         corroborated, conflicts = _cross_source_comparison(results.values())
+        has_degraded_source = bool(errors) or any(
+            status not in {NewsProviderStatus.AVAILABLE.value}
+            for status in source_statuses.values()
+        )
         self._last_status = (
-            NewsProviderStatus.AVAILABLE
-            if not errors
-            else NewsProviderStatus.PARTIAL
+            NewsProviderStatus.PARTIAL if has_degraded_source else NewsProviderStatus.AVAILABLE
         )
         self._last_diagnostics = self._diagnostics(
             results,
             errors,
+            source_statuses=source_statuses,
             corroborated=corroborated,
             conflicts=conflicts,
+            suppressed=suppressed,
         )
         return merged
 
@@ -80,19 +129,14 @@ class CrossCheckedNewsProvider:
         results: dict[str, tuple[RawNewsItem, ...]],
         errors: dict[str, NewsProviderError],
         *,
+        source_statuses: dict[str, str],
         corroborated: int = 0,
         conflicts: int = 0,
+        suppressed: set[str] | None = None,
     ) -> dict[str, object]:
         statuses = {
-            name: (
-                "ERROR:" + error.status.value
-                if (error := errors.get(name)) is not None
-                else "AVAILABLE"
-            )
-            for name in {
-                str(getattr(self._primary, "provider_name", "primary")),
-                str(getattr(self._secondary, "provider_name", "secondary")),
-            }
+            name: "ERROR:" + errors[name].status.value if name in errors else status
+            for name, status in source_statuses.items()
         }
         return {
             "status": self._last_status.value,
@@ -100,6 +144,8 @@ class CrossCheckedNewsProvider:
             "articles_by_provider": {name: len(items) for name, items in results.items()},
             "corroborated_event_groups": corroborated,
             "conflicting_event_groups": conflicts,
+            "suppressed_provider_count": len(suppressed or ()),
+            "suppressed_provider_names": tuple(sorted(suppressed or ())),
             "cross_source_status": (
                 "CORROBORATED" if corroborated else "NO_CROSS_SOURCE_MATCH"
             ),
@@ -113,17 +159,26 @@ def _cross_source_comparison(
     sets = [tuple(items) for items in result_sets]
     if len(sets) < 2:
         return 0, 0
-    left, right = sets[0], sets[1]
     corroborated = 0
     conflicts = 0
-    for first in left:
-        matches = [second for second in right if _same_event(first, second)]
-        if not matches:
-            continue
-        corroborated += 1
-        if any(_sentiment_polarity(first) * _sentiment_polarity(second) < 0 for second in matches):
-            conflicts += 1
+    for left_index, left in enumerate(sets[:-1]):
+        for right in sets[left_index + 1 :]:
+            for first in left:
+                matches = [second for second in right if _same_event(first, second)]
+                if not matches:
+                    continue
+                corroborated += 1
+                if any(
+                    _sentiment_polarity(first) * _sentiment_polarity(second) < 0
+                    for second in matches
+                ):
+                    conflicts += 1
     return corroborated, conflicts
+
+
+def _provider_label(provider: GlobalNewsProvider) -> str:
+    name = str(getattr(provider, "provider_name", type(provider).__name__))
+    return {"ALPACA_NEWS": "ALPACA", "GDELT_DOC": "GDELT"}.get(name, name)
 
 
 def _same_event(first: RawNewsItem, second: RawNewsItem) -> bool:

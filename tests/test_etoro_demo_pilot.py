@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from app.brokers.etoro.demo_pilot import (
 )
 from app.brokers.etoro.http import DisciplinedHttpClient, HttpResponse, TransportError
 from app.brokers.models import ExecutionState, PreflightDecision
+from app.config.models import ApplicationConfig
 from app.domain.enums import AssetClass, MarketStatus, OperatingMode
 from app.domain.proposals import TradeProposal
 from app.domain.risk import AuthorizedCapitalEnvelope, RiskAuthorization, RiskContext
@@ -297,6 +298,30 @@ def test_duplicate_cycle_candidate_submits_at_most_once(tmp_path: Path) -> None:
     assert len(gateway.intents) == 1
 
 
+def test_unresolved_instrument_submission_blocks_new_cycle_duplicate(tmp_path: Path) -> None:
+    store = SqliteRecordStore(tmp_path / "store.sqlite3")
+    assert store.reserve_demo_submission(
+        "prior-cycle:AAPL:OPEN",
+        {"instrument_id": 1001, "symbol": "AAPL", "amount_eur": "10", "account_currency": "EUR"},
+    )
+    store.update_demo_submission(
+        "prior-cycle:AAPL:OPEN",
+        "SUBMITTED",
+        {"instrument_id": 1001, "symbol": "AAPL", "amount_eur": "10", "account_currency": "EUR"},
+    )
+    gateway = FakeDemoGateway(store)
+
+    result = _pilot(store, gateway=gateway).run(
+        cycle=_cycle(),
+        scanner_result=_scanner_result((_top_candidate("AAPL"),)),
+        broker_instrument_ids={"AAPL": 1001},
+    )
+
+    assert result.status is EtoroDemoPilotStatus.BLOCKED
+    assert EtoroDemoPilotBlocker.UNRESOLVED_INSTRUMENT_SUBMISSION in result.blockers
+    assert gateway.intents == []
+
+
 def test_ambiguous_instrument_blocks_before_submission(tmp_path: Path) -> None:
     store = SqliteRecordStore(tmp_path / "store.sqlite3")
     gateway = FakeDemoGateway(store)
@@ -336,6 +361,27 @@ def test_missing_or_invalid_pilot_notional_blocks(tmp_path: Path) -> None:
     assert result.demo_broker_write_calls == 0
 
 
+def test_missing_execution_packages_never_create_nominal_exposure_intents(
+    tmp_path: Path,
+) -> None:
+    store = SqliteRecordStore(tmp_path / "store.sqlite3")
+    gateway = FakeDemoGateway(store)
+    result = _pilot(store, gateway=gateway).run(
+        cycle=_cycle(),
+        scanner_result=_scanner_result((_top_candidate("AAPL"),)),
+        broker_instrument_ids={"AAPL": 1001},
+        submission_packages={},
+    )
+
+    assert result.status is EtoroDemoPilotStatus.BLOCKED
+    assert result.blockers == (
+        EtoroDemoPilotBlocker.VERIFIED_EXECUTION_MATERIAL_UNAVAILABLE,
+    )
+    assert result.eligible_intents == ()
+    assert result.submissions == ()
+    assert gateway.intents == []
+
+
 def test_real_environment_hard_rejection(tmp_path: Path) -> None:
     gateway = FakeDemoGateway(SqliteRecordStore(tmp_path / "store.sqlite3"))
     result = EtoroAutomaticDemoPilot(
@@ -372,6 +418,8 @@ def test_api_rejection_does_not_create_false_success(tmp_path: Path) -> None:
     assert result.status is EtoroDemoPilotStatus.BLOCKED
     assert result.blockers == (EtoroDemoPilotBlocker.DEMO_SUBMISSION_FAILED,)
     assert result.submissions[0].submitted is False
+    assert result.submissions[0].symbol == "AAPL"
+    assert result.submissions[0].asset_class == AssetClass.EQUITY.value
     assert result.demo_broker_write_calls == 0
     assert result.broker_write_calls_real == 0
 
@@ -410,6 +458,7 @@ def test_risk_checked_gateway_top_pass_posts_once_and_reconciles(
         kill_switch=kill_switch,
         registry=store,
         readback=readback,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(intent, package=package)
@@ -423,6 +472,113 @@ def test_risk_checked_gateway_top_pass_posts_once_and_reconciles(
     assert transport.calls[0][0] == "POST"
     assert transport.calls[0][1] == DEMO_ORDER_URL
     assert "api-secret" not in outcome.model_dump_json()
+
+
+def test_risk_checked_gateway_rejects_expired_authorization_before_post(
+    tmp_path: Path,
+    proposal: TradeProposal,
+    context: RiskContext,
+    risk_manager: RiskManager,
+    kill_switch: KillSwitch,
+) -> None:
+    store = SqliteRecordStore(tmp_path / "store.sqlite3")
+    transport = StubEtoroTransport()
+    intent = _intent_for_proposal(proposal)
+    gateway = RiskCheckedEtoroDemoSubmissionGateway(
+        environment=OperatingMode.ETORO_DEMO,
+        credentials=EtoroCredentials(api_key="api-secret", user_key="user-secret"),
+        http=DisciplinedHttpClient(transport),
+        risk_manager=risk_manager,
+        gate=RiskEnforcedExecutionGate(risk_manager),
+        kill_switch=kill_switch,
+        registry=store,
+        clock=lambda: context.evaluated_at
+        + timedelta(seconds=ApplicationConfig().risk.authorization_ttl_seconds + 1),
+    )
+
+    outcome = gateway.submit_demo_order(
+        intent, package=_package_for_intent(intent, proposal, context)
+    )
+
+    assert outcome.submitted is False
+    assert outcome.sanitized_status == "EXECUTION_ADMISSION_GATE_REJECTED"
+    assert transport.calls == []
+    assert store.demo_submission(intent.idempotency_key) is None
+
+
+def test_risk_checked_gateway_records_actual_submission_time(
+    tmp_path: Path,
+    proposal: TradeProposal,
+    context: RiskContext,
+    risk_manager: RiskManager,
+    kill_switch: KillSwitch,
+) -> None:
+    store = SqliteRecordStore(tmp_path / "store.sqlite3")
+    transport = StubEtoroTransport()
+    intent = _intent_for_proposal(proposal)
+    submission_time = context.evaluated_at + timedelta(seconds=10)
+    gateway = RiskCheckedEtoroDemoSubmissionGateway(
+        environment=OperatingMode.ETORO_DEMO,
+        credentials=EtoroCredentials(api_key="api-secret", user_key="user-secret"),
+        http=DisciplinedHttpClient(transport),
+        risk_manager=risk_manager,
+        gate=RiskEnforcedExecutionGate(risk_manager),
+        kill_switch=kill_switch,
+        registry=store,
+        clock=lambda: submission_time,
+    )
+
+    outcome = gateway.submit_demo_order(
+        intent, package=_package_for_intent(intent, proposal, context)
+    )
+
+    assert outcome.submitted is True
+    assert len(transport.calls) == 1
+    assert store.demo_submission(intent.idempotency_key)["payload"]["submitted_at"] == (
+        submission_time.isoformat()
+    )
+
+
+def test_risk_checked_gateway_expiry_after_reservation_is_rejected_without_post(
+    tmp_path: Path,
+    proposal: TradeProposal,
+    context: RiskContext,
+    risk_manager: RiskManager,
+    kill_switch: KillSwitch,
+) -> None:
+    store = SqliteRecordStore(tmp_path / "store.sqlite3")
+    transport = StubEtoroTransport()
+    intent = _intent_for_proposal(proposal)
+    checks = iter(
+        (
+            context.evaluated_at + timedelta(seconds=1),
+            context.evaluated_at + timedelta(seconds=1),
+            context.evaluated_at
+            + timedelta(seconds=ApplicationConfig().risk.authorization_ttl_seconds + 1),
+        )
+    )
+    gateway = RiskCheckedEtoroDemoSubmissionGateway(
+        environment=OperatingMode.ETORO_DEMO,
+        credentials=EtoroCredentials(api_key="api-secret", user_key="user-secret"),
+        http=DisciplinedHttpClient(transport),
+        risk_manager=risk_manager,
+        gate=RiskEnforcedExecutionGate(risk_manager),
+        kill_switch=kill_switch,
+        registry=store,
+        clock=lambda: next(checks),
+    )
+
+    outcome = gateway.submit_demo_order(
+        intent, package=_package_for_intent(intent, proposal, context)
+    )
+
+    assert outcome.submitted is False
+    assert outcome.demo_broker_write_calls == 0
+    assert transport.calls == []
+    record = store.demo_submission(intent.idempotency_key)
+    assert record is not None
+    assert record["state"] == "REJECTED"
+    assert record["payload"]["rejection_reason"] == "PRE_POST_SAFETY_GATE_REJECTED"
 
 
 def test_risk_manager_rejects_before_post(
@@ -448,6 +604,7 @@ def test_risk_manager_rejects_before_post(
         gate=RiskEnforcedExecutionGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(intent, package=stale_package)
@@ -476,6 +633,7 @@ def test_execution_admission_gate_rejects_before_post(
         gate=RejectingGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(
@@ -507,6 +665,7 @@ def test_preflight_rejects_before_post(
         gate=RiskEnforcedExecutionGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(
@@ -541,6 +700,7 @@ def test_api_rejection_after_post_is_not_false_success(
         gate=RiskEnforcedExecutionGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(
@@ -572,6 +732,7 @@ def test_ambiguous_timeout_after_post_requires_reconciliation_and_no_blind_retry
         gate=RiskEnforcedExecutionGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
 
     outcome = gateway.submit_demo_order(
@@ -603,6 +764,7 @@ def test_restart_after_success_blocks_duplicate_before_gateway(
         gate=RiskEnforcedExecutionGate(risk_manager),
         kill_switch=kill_switch,
         registry=store,
+        clock=lambda: context.evaluated_at,
     )
     pilot = EtoroAutomaticDemoPilot(
         environment=OperatingMode.ETORO_DEMO,
@@ -773,6 +935,7 @@ def _package_for_intent(
             if context.instrument is not None
             else None,
             "capital_envelope": AuthorizedCapitalEnvelope(
+                currency=checked_proposal.currency,
                 authorized_capital_eur=Decimal("50"), managed_exposure_eur=Decimal("0")
             ),
         }

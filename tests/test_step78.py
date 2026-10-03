@@ -606,6 +606,20 @@ def test_portfolio_fit_scores_cash_reserve_concentration_and_diversification() -
     assert blocked.status is PortfolioFitStatus.BLOCKED
     assert "available cash is insufficient" in blocked.reasons
 
+    at_reserve = PortfolioFitEngine().evaluate(
+        candidate=_candidate(instrument),
+        portfolio=_portfolio(cash=Decimal("1000")),
+        proposed_exposure=Decimal("930"),
+    )
+    below_reserve = PortfolioFitEngine().evaluate(
+        candidate=_candidate(instrument),
+        portfolio=_portfolio(cash=Decimal("1000")),
+        proposed_exposure=Decimal("930.01"),
+    )
+    assert at_reserve.projected_cash_reserve == Decimal("0.0700")
+    assert "projected cash reserve would be below policy baseline" not in at_reserve.reasons
+    assert "projected cash reserve would be below policy baseline" in below_reserve.reasons
+
 
 def test_correlation_engine_reports_quality_without_false_precision() -> None:
     instrument = _instrument("AAA", instrument_id=1)

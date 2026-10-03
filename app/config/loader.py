@@ -14,11 +14,13 @@ from app.config.models import (
     MarketScannerConfig,
     PaperTradingConfig,
     ProviderConfig,
+    RiskPolicyConfig,
 )
 from app.domain.enums import (
     AIProviderMode,
     BrokerExecutionMode,
     BrokerProviderMode,
+    Currency,
     Environment,
     EtoroTransportMode,
     ExecutionPolicy,
@@ -65,6 +67,17 @@ def _parse_optional_positive_decimal(name: str, value: str | None) -> Decimal | 
         raise ConfigLoadError(f"{name} must be a positive decimal") from exc
     if parsed <= 0:
         raise ConfigLoadError(f"{name} must be a positive decimal")
+    return parsed
+
+
+def _parse_fraction(name: str, value: str | None, *, default: str) -> Decimal:
+    raw = default if value is None or not value.strip() else value.strip()
+    try:
+        parsed = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ConfigLoadError(f"{name} must be a decimal fraction") from exc
+    if parsed < 0 or parsed >= 1:
+        raise ConfigLoadError(f"{name} must be between 0 and 1")
     return parsed
 
 
@@ -146,17 +159,46 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
         broker_execution_mode = _parse_broker_execution_mode(
             source.get("AEGIS_BROKER_EXECUTION_MODE")
         )
-        authorized_capital_eur = _parse_optional_positive_decimal(
-            "AEGIS_AUTHORIZED_CAPITAL_EUR", source.get("AEGIS_AUTHORIZED_CAPITAL_EUR")
+        raw_capital_currency = source.get("AEGIS_AUTHORIZED_CAPITAL_CURRENCY")
+        if raw_capital_currency is None:
+            raw_capital_currency = (
+                "USD"
+                if source.get("AEGIS_AUTHORIZED_CAPITAL_USD")
+                and not source.get("AEGIS_AUTHORIZED_CAPITAL_EUR")
+                else "EUR"
+            )
+        try:
+            authorized_capital_currency = Currency(raw_capital_currency.strip().upper())
+        except ValueError as exc:
+            raise ConfigLoadError(
+                "AEGIS_AUTHORIZED_CAPITAL_CURRENCY must be EUR or USD"
+            ) from exc
+        raw_authorized_capital = source.get("AEGIS_AUTHORIZED_CAPITAL")
+        if raw_authorized_capital is None:
+            raw_authorized_capital = source.get(
+                f"AEGIS_AUTHORIZED_CAPITAL_{authorized_capital_currency.value}"
+            )
+        if raw_authorized_capital is None:
+            # Backward compatibility for installations that still use the
+            # original EUR-named variable with an explicit currency setting.
+            raw_authorized_capital = source.get("AEGIS_AUTHORIZED_CAPITAL_EUR")
+        authorized_capital = _parse_optional_positive_decimal(
+            "AEGIS_AUTHORIZED_CAPITAL", raw_authorized_capital
         )
         confidence_profile = source.get("AEGIS_CONFIDENCE_PROFILE", "V1_LEGACY").strip().upper()
         exit_policy_profile = (
             source.get("AEGIS_EXIT_POLICY_PROFILE", "EXITPOLICY_V1_LEGACY").strip().upper()
         )
+        min_cash_reserve = _parse_fraction(
+            "AEGIS_MIN_CASH_RESERVE",
+            source.get("AEGIS_MIN_CASH_RESERVE"),
+            default="0.07",
+        )
         return ApplicationConfig(
             environment=environment,
             operating_mode=operating_mode,
-            authorized_capital_eur=authorized_capital_eur,
+            authorized_capital_eur=authorized_capital,
+            authorized_capital_currency=authorized_capital_currency,
             etoro_api_enabled=api_enabled,
             etoro_demo_execution_enabled=demo_enabled,
             etoro_demo_automatic_pilot_enabled=automatic_demo_pilot_enabled,
@@ -177,6 +219,7 @@ def load_config(values: Mapping[str, str] | None = None) -> ApplicationConfig:
                 confidence_profile=confidence_profile,
                 exit_policy_profile=exit_policy_profile,
             ),
+            risk=RiskPolicyConfig(min_cash_reserve=min_cash_reserve),
             scanner=MarketScannerConfig(
                 discovery_limit=_parse_positive_int(
                     "AEGIS_SCANNER_DISCOVERY_LIMIT",

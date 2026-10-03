@@ -4,7 +4,7 @@ from decimal import Decimal
 from app.config.loader import load_config
 from app.domain.enums import AssetClass, Currency, MarketStatus, SettlementType
 from app.domain.universe import UniversalInstrument
-from app.news.alpaca import AlpacaNewsProvider
+from app.news.alpaca import AlpacaNewsProvider, alpaca_news_symbol
 from app.news.crosscheck import CrossCheckedNewsProvider
 from app.news.intelligence import (
     NewsProviderError,
@@ -118,6 +118,22 @@ def test_alpaca_news_is_causal_and_does_not_expose_headers() -> None:
     assert "BTCUSD" in transport.urls[0]
 
 
+def test_alpaca_news_normalizes_etoro_session_suffix_and_skips_foreign_exchange() -> None:
+    transport = _Transport({"news": []})
+    provider = AlpacaNewsProvider(
+        api_key_id="alpaca-id",
+        api_secret_key="alpaca-secret",
+        transport=transport,
+        symbols=("AMAT.RTH", "RAYb.ST", "CRYPTO:BTC"),
+    )
+
+    provider.fetch_global_news(as_of=AS_OF)
+
+    assert alpaca_news_symbol("AMAT.RTH") == "AMAT"
+    assert alpaca_news_symbol("RAYb.ST") is None
+    assert "symbols=AMAT%2CBTCUSD" in transport.urls[0]
+
+
 def test_crosscheck_preserves_partial_primary_data_and_reports_status() -> None:
     primary = _Provider(
         "ALPHA_VANTAGE",
@@ -133,6 +149,34 @@ def test_crosscheck_preserves_partial_primary_data_and_reports_status() -> None:
     ).fetch_global_news(as_of=AS_OF)
 
     assert len(result) == 1
+
+
+def test_crosscheck_cools_down_only_rate_limited_source_and_keeps_gdelt_fallback() -> None:
+    class _RateLimited(_Provider):
+        def __init__(self) -> None:
+            super().__init__("ALPHA_VANTAGE", ())
+            self.calls = 0
+
+        def fetch_global_news(self, *, as_of: datetime) -> tuple[RawNewsItem, ...]:
+            self.calls += 1
+            raise NewsProviderError(
+                "rate limited", status=NewsProviderStatus.RATE_LIMITED
+            )
+
+    alpha = _RateLimited()
+    gdelt = _Provider(
+        "GDELT_DOC",
+        (_item("Market risk from new sanctions", "GDELT outlet", provider="GDELT_DOC"),),
+    )
+    provider = CrossCheckedNewsProvider(alpha, gdelt)
+
+    assert provider.fetch_global_news(as_of=AS_OF)
+    assert provider.last_status is NewsProviderStatus.PARTIAL
+    assert provider.fetch_global_news(as_of=AS_OF)
+
+    assert alpha.calls == 1
+    assert provider.last_diagnostics["suppressed_provider_count"] == 1
+    assert provider.last_diagnostics["suppressed_provider_names"] == ("ALPHA_VANTAGE",)
 
 
 def test_runtime_factory_can_select_alpha_plus_alpaca_without_real_writes() -> None:

@@ -161,6 +161,7 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
     parser.add_argument("--confirm-demo-write", action="store_true")
     parser.add_argument("--diagnose-live-quote", action="store_true")
     parser.add_argument("--diagnose-demo-eligibility", action="store_true")
+    parser.add_argument("--diagnostic-read-only", action="store_true")
     args = parser.parse_args(argv)
     runtime_values = load_runtime_values(values)
     config = load_config(runtime_values)
@@ -534,6 +535,7 @@ def main(argv: Sequence[str] | None = None, *, values: Mapping[str, str] | None 
                 config,
                 values=runtime_values,
                 max_iterations=args.max_iterations,
+                diagnostic_read_only=args.diagnostic_read_only,
             ),
         }
     elif args.command == "etoro-demo-runtime-stop":

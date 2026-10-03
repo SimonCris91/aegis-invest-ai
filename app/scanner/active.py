@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import Counter
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -36,7 +37,46 @@ from app.intelligence.models import (
 from app.intelligence.service import AegisOpportunityIntelligenceEngine
 from app.policies.defaults import DEFAULT_POLICY_VERSION
 
-ACTIVE_SCANNER_VERSION = "active-market-scanner-v1"
+ACTIVE_SCANNER_VERSION = "active-market-scanner-v3-multiasset-fair"
+
+_CRYPTO_QUOTE_ASSETS = tuple(
+    sorted(
+        {
+            "USDT",
+            "USDC",
+            "USD",
+            "EUR",
+            "GBP",
+            "AUD",
+            "CAD",
+            "CHF",
+            "JPY",
+            "NZD",
+            "HKD",
+            "SGD",
+            "CNH",
+            "CNY",
+            "BRL",
+            "MXN",
+            "TRY",
+            "ZAR",
+            "SEK",
+            "NOK",
+            "DKK",
+            "PLN",
+            "THB",
+            "BTC",
+            "ETH",
+            "BNB",
+            "SOL",
+            "XRP",
+            "ADA",
+            "DOT",
+        },
+        key=len,
+        reverse=True,
+    )
+)
 
 
 class ActiveScannerBucket(StrEnum):
@@ -176,6 +216,41 @@ class ActiveScannerCrossAssetSnapshot(FrozenDomainModel):
         return require_aware(value, "scanner cycle timestamp")
 
 
+def _fair_asset_class_order(
+    candidates: tuple[ActiveScannerCandidate, ...],
+) -> tuple[ActiveScannerCandidate, ...]:
+    """Interleave score-ranked candidates so one class cannot fill a bounded lane."""
+    if len(candidates) < 2:
+        return candidates
+    by_class: dict[AssetClass, list[ActiveScannerCandidate]] = {}
+    for candidate in candidates:
+        by_class.setdefault(candidate.asset_class, []).append(candidate)
+    class_order = [
+        asset_class
+        for asset_class in (AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO)
+        if asset_class in by_class
+    ]
+    class_order.extend(
+        sorted(
+            (asset_class for asset_class in by_class if asset_class not in class_order),
+            key=lambda asset_class: asset_class.value,
+        )
+    )
+    ordered: list[ActiveScannerCandidate] = []
+    index = 0
+    while class_order:
+        next_order: list[AssetClass] = []
+        for asset_class in class_order:
+            bucket = by_class[asset_class]
+            if index < len(bucket):
+                ordered.append(bucket[index])
+            if index + 1 < len(bucket):
+                next_order.append(asset_class)
+        class_order = next_order
+        index += 1
+    return tuple(ordered)
+
+
 class ActiveMarketScanner:
     """Scans cached market data and ranks opportunities without execution access."""
 
@@ -257,17 +332,21 @@ class ActiveMarketScanner:
         ranked = tuple(
             item.model_copy(update={"rank": index}) for index, item in enumerate(ordered, start=1)
         )
+        top_candidates = _deduplicate_crypto_quote_pairs(
+            tuple(item for item in ranked if item.bucket is ActiveScannerBucket.TOP_OPPORTUNITIES)
+        )
+        top_candidates = _fair_asset_class_order(top_candidates)[: self._top_n]
+        watchlist_candidates = _deduplicate_crypto_quote_pairs(
+            tuple(item for item in ranked if item.bucket is ActiveScannerBucket.WATCHLIST)
+        )
+        watchlist_candidates = _fair_asset_class_order(watchlist_candidates)
         return ActiveScannerResult(
             as_of=as_of,
             timeframe=timeframe,
             simulated_capital=simulated_capital,
             candidates=ranked,
-            top_opportunities=tuple(
-                item for item in ranked if item.bucket is ActiveScannerBucket.TOP_OPPORTUNITIES
-            )[: self._top_n],
-            watchlist=tuple(
-                item for item in ranked if item.bucket is ActiveScannerBucket.WATCHLIST
-            ),
+            top_opportunities=top_candidates,
+            watchlist=watchlist_candidates,
             no_trade=tuple(item for item in ranked if item.bucket is ActiveScannerBucket.NO_TRADE),
             rejected=tuple(item for item in ranked if item.bucket is ActiveScannerBucket.REJECTED),
             duplicate_decisions_prevented=duplicate_decisions_prevented,
@@ -277,6 +356,7 @@ class ActiveMarketScanner:
                 if portfolio.positions_for(_instrument_id(instrument))
             ),
         )
+
 
     def build_observation_snapshot(
         self,
@@ -504,6 +584,43 @@ class ActiveMarketScanner:
             else analysis.reasons,
             **_news_candidate_fields(news_context),
         )
+
+
+def _deduplicate_crypto_quote_pairs(
+    candidates: tuple[ActiveScannerCandidate, ...],
+) -> tuple[ActiveScannerCandidate, ...]:
+    """Keep the strongest quoted market for each crypto in decision lanes.
+
+    Every market remains in ``candidates`` for auditability; the TOP and
+    WATCHLIST lanes avoid presenting BTCUSD, BTCEUR, etc. as separate assets.
+    """
+    selected: list[ActiveScannerCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        if candidate.asset_class is not AssetClass.CRYPTO:
+            selected.append(candidate)
+            continue
+        symbol = candidate.symbol.upper().removeprefix("CRYPTO:")
+        base_symbol = symbol.split("/", 1)[0].split(":", 1)[0]
+        if base_symbol == symbol:
+            base_symbol = next(
+                (
+                    symbol[: -len(quote_asset)]
+                    for quote_asset in _CRYPTO_QUOTE_ASSETS
+                    if symbol.endswith(quote_asset) and len(symbol) > len(quote_asset)
+                ),
+                symbol,
+            )
+        if base_symbol == symbol and "/" in candidate.full_asset_name:
+            base_name = candidate.full_asset_name.split("/", 1)[0]
+            normalized_name = re.sub(r"[^a-z0-9]+", "", base_name.casefold())
+            base_symbol = normalized_name or symbol
+        key = (candidate.asset_class.value, base_symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(candidate)
+    return tuple(selected)
 
 
 def attach_observational_news_context(
@@ -747,7 +864,12 @@ def _market_closed_for_instrument(*, instrument: UniversalInstrument, as_of: dat
         return False
     if "session-state:CLOSED" in instrument.tags:
         return True
-    return _is_market_closed_as_of(as_of)
+    # A missing session observation is no more evidence of closure than an
+    # explicit UNKNOWN. The old 13:00-21:00 UTC fallback was US-specific and
+    # silently discarded fresh European equities/ETFs every morning. Keep
+    # the global weekend safeguard; on weekdays use bar freshness for the
+    # scanner and require a broker-verified open/tradable state at preflight.
+    return as_of.weekday() >= 5
 
 
 def _expected_completed_one_hour_bar_timestamp(as_of: datetime) -> datetime:
@@ -893,10 +1015,10 @@ def _news_signal_from_context(
 ) -> NewsSignal | None:
     """Translate global per-asset context into the scanner's typed news signal.
 
-    The global news engine is intentionally observational, but its result must
-    still be available to the strategy model.  Returning ``None`` is reserved
-    for an absent context; a present but empty context remains explicitly
-    data-insufficient and therefore cannot silently become positive evidence.
+    Only asset-linked news reaches the strategy score, weighted by event
+    impact and source confidence. Returning ``None`` is reserved for an absent
+    context; a present but empty context remains data-insufficient and cannot
+    silently become positive evidence.
     """
     if context is None:
         return None
@@ -916,8 +1038,11 @@ def _news_signal_from_context(
         else Decimal("0")
     )
     unique_events = max(0, int(payload.get("unique_event_count", 0) or 0))
-    relevance = Decimal(str(payload.get("aggregate_relevance", "0") or "0"))
     event_risk = Decimal(str(payload.get("event_risk", "0") or "0"))
+    source_reliability = Decimal(
+        str(payload.get("aggregate_source_reliability", "0") or "0")
+    )
+    aggregate_impact = Decimal(str(payload.get("aggregate_impact", "0") or "0"))
     freshness = str(payload.get("freshness", "NEWS_SOURCE_UNAVAILABLE"))
     if unique_events <= 0:
         status = (
@@ -928,19 +1053,26 @@ def _news_signal_from_context(
         confidence = Decimal("0")
     else:
         status = NewsSignalStatus.AVAILABLE
-        confidence = max(Decimal("0"), min(Decimal("1"), relevance))
+        # Ticker relevance alone is not source credibility. A low-quality or
+        # single-provider article must not receive the same scoring weight as
+        # corroborated, primary reporting.
+        confidence = max(
+            Decimal("0"),
+            min(
+                Decimal("1"),
+                Decimal(str(payload.get("aggregate_confidence", "0") or "0")),
+            ),
+        )
     return NewsSignal(
         instrument=instrument,
         timestamp=as_of,
         status=status,
         sentiment=sentiment if unique_events else None,
-        impact=max(Decimal("0"), min(Decimal("1"), max(relevance, event_risk)))
+        impact=max(Decimal("0"), min(Decimal("1"), max(aggregate_impact, event_risk)))
         if unique_events
         else None,
         confidence=confidence,
-        source_quality=max(
-            Decimal("0"), min(Decimal("1"), Decimal(unique_events) / Decimal("3"))
-        ),
+        source_quality=max(Decimal("0"), min(Decimal("1"), source_reliability)),
         event_risks=(),
     )
 
@@ -982,10 +1114,6 @@ def _proposed_allocation(
         Decimal("0.01"), rounding=ROUND_DOWN
     )
     return max(minimum, policy_amount)
-
-
-def _is_market_closed_as_of(as_of: datetime) -> bool:
-    return as_of.weekday() >= 5 or as_of.hour < 13 or as_of.hour > 21
 
 
 def _observation_from_candidate(

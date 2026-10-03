@@ -270,7 +270,16 @@ class RiskManager:
                 "price metadata does not match the proposed instrument",
             )
 
-        if total_value <= 0 or not portfolio.is_consistent(self._policy.portfolio_value_tolerance):
+        # Broker position exposures are reported at cent precision. When several
+        # positions are reconstructed locally, the sum can therefore differ from
+        # the broker-reported portfolio total by one cent per position without
+        # indicating a real state inconsistency. Keep the configured tolerance as
+        # the floor, then add only this bounded reconciliation envelope.
+        reconciliation_tolerance = max(
+            self._policy.portfolio_value_tolerance,
+            Decimal("0.01") * max(1, len(portfolio.positions)),
+        )
+        if total_value <= 0 or not portfolio.is_consistent(reconciliation_tolerance):
             reject(
                 RiskViolationCode.INCONSISTENT_PORTFOLIO_STATE,
                 "portfolio totals are invalid or inconsistent with the reported API state",
@@ -398,6 +407,22 @@ class RiskManager:
     ) -> RiskEvaluation:
         """Size an entry inside the user envelope, then apply all normal risk checks."""
         envelope = context.capital_envelope
+        if envelope is not None and (
+            envelope.currency is not proposal.currency
+            or envelope.currency is not context.portfolio.currency
+        ):
+            return self.evaluate(
+                proposal,
+                context,
+                issue_authorization=issue_authorization,
+                minimum_confidence_override=minimum_confidence_override,
+                _additional_violations=(
+                    RiskViolation(
+                        code=RiskViolationCode.CURRENCY_MISMATCH,
+                        message="authorized exposure and the Demo account must use the same currency",
+                    ),
+                ),
+            )
         if proposal.intent not in {TradeIntent.OPEN, TradeIntent.INCREASE}:
             return self.evaluate(
                 proposal,

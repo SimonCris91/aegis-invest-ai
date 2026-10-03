@@ -1,9 +1,10 @@
 """Explicit Stage B arming for one controlled eToro Demo submission."""
 
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
 
 from pydantic import Field, field_validator
 
@@ -46,6 +47,7 @@ from app.execution.gate import RiskEnforcedExecutionGate
 from app.news.alpaca import AlpacaNewsProvider
 from app.news.alpha_vantage import AlphaVantageNewsProvider
 from app.news.crosscheck import CrossCheckedNewsProvider
+from app.news.gdelt import GdeltNewsProvider
 from app.news.intelligence import (
     GlobalNewsIntelligenceEngine,
     GlobalNewsProvider,
@@ -60,8 +62,12 @@ class DemoExecutionArmingError(RuntimeError):
     """Raised when Stage B cannot be armed safely."""
 
 
+_DEMO_GDELT_PROVIDER: GdeltNewsProvider | None = None
+_DEMO_GDELT_PROVIDER_LOCK = Lock()
+
+
 class _RunNewsSession:
-    def __init__(self, provider: AlphaVantageNewsProvider) -> None:
+    def __init__(self, provider: GlobalNewsProvider) -> None:
         self.provider = provider
         self.engine = GlobalNewsIntelligenceEngine(provider)
         self.cache: dict[tuple[str, str], tuple[tuple[NewsItem, ...], dict[str, object]]] = {}
@@ -150,6 +156,11 @@ class _ConfiguredDemoNewsProvider:
         provider_status = result.provider_status.value
         if self._session is not None:
             self._session.provider_diagnostics = dict(result.provider_diagnostics)
+            suppressed_sources = result.provider_diagnostics.get(
+                "suppressed_provider_count", 0
+            )
+            if isinstance(suppressed_sources, int) and suppressed_sources > 0:
+                self._session.requests_suppressed_after_rate_limit += suppressed_sources
         if self._session is not None:
             self._session.last_status = provider_status
             if provider_status == NewsProviderStatus.RATE_LIMITED.value:
@@ -264,19 +275,39 @@ def _configured_news_provider(
     values: Mapping[str, str],
     *,
     tickers: tuple[str, ...] = (),
-) -> AlphaVantageNewsProvider | CrossCheckedNewsProvider:
+) -> GlobalNewsProvider:
     primary = AlphaVantageNewsProvider(
         api_key=values.get("ALPHA_VANTAGE_API_KEY"),
         tickers=tickers,
     )
-    if values.get("AEGIS_NEWS_SECONDARY_PROVIDER", "").strip().lower() != "alpaca":
-        return primary
-    secondary = AlpacaNewsProvider(
-        api_key_id=_first_nonempty(values, "ALPACA_API_KEY_ID", "APCA_API_KEY_ID"),
-        api_secret_key=_first_nonempty(values, "ALPACA_API_SECRET_KEY", "APCA_API_SECRET_KEY"),
-        symbols=tickers,
-    )
-    return CrossCheckedNewsProvider(primary, secondary)
+    sources: list[GlobalNewsProvider] = [primary]
+    if values.get("AEGIS_NEWS_SECONDARY_PROVIDER", "").strip().lower() == "alpaca":
+        sources.append(
+            AlpacaNewsProvider(
+                api_key_id=_first_nonempty(values, "ALPACA_API_KEY_ID", "APCA_API_KEY_ID"),
+                api_secret_key=_first_nonempty(
+                    values, "ALPACA_API_SECRET_KEY", "APCA_API_SECRET_KEY"
+                ),
+                symbols=tickers,
+            )
+        )
+    if values.get("AEGIS_NEWS_GDELT_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        sources.append(_shared_demo_gdelt_provider())
+    return primary if len(sources) == 1 else CrossCheckedNewsProvider(*sources)
+
+
+def _shared_demo_gdelt_provider() -> GdeltNewsProvider:
+    """Reuse a bounded, read-only GDELT cache in Demo preflight runs."""
+    global _DEMO_GDELT_PROVIDER
+    with _DEMO_GDELT_PROVIDER_LOCK:
+        if _DEMO_GDELT_PROVIDER is None:
+            _DEMO_GDELT_PROVIDER = GdeltNewsProvider(
+                cache_ttl=timedelta(minutes=30),
+                cache_path=Path("work") / "gdelt-news-cache.json",
+            )
+        return _DEMO_GDELT_PROVIDER
 
 
 def _first_nonempty(values: Mapping[str, str], *names: str) -> str | None:

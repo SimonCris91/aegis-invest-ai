@@ -45,6 +45,7 @@ from app.agent.service import DeterministicAegisAgent
 from app.config import load_config
 from app.config.models import ApplicationConfig
 from app.data.runtime import (
+    _exit_policy_v2_multi_asset_qualification,
     build_exit_policy_v2_train_validation_report,
     build_prospective_shadow_validation_readiness_report,
 )
@@ -1187,6 +1188,39 @@ def test_frozen_balanced_candidate_runs_synthetic_train_validation() -> None:
     assert result.lifecycle is not None
     assert result.lifecycle.initial_cash == Decimal("200")
     assert len(result.decisions) > 0
+
+
+def test_exit_policy_v2_multi_asset_qualification_requires_same_candidate_per_class() -> None:
+    def row(asset_class: str, candidate_id: str, *, completed_trades: int = 3) -> dict[str, object]:
+        return {
+            "asset_class": asset_class,
+            "candidate_bundle_id": candidate_id,
+            "status": "EXECUTED_TRAIN_VALIDATION_ONLY",
+            "completed_trades": completed_trades,
+            "close": completed_trades,
+            "max_drawdown": "0.10",
+            "cooldown_reentry_blocks": 0,
+            "data_quality_exclusions": 0,
+            "realized_pnl": "1",
+        }
+
+    required_classes = ("CRYPTO", "EQUITY", "ETF")
+    equity_only = _exit_policy_v2_multi_asset_qualification(
+        [row("EQUITY", "balanced"), row("ETF", "balanced", completed_trades=0)],
+        required_asset_classes=required_classes,
+    )
+    assert equity_only["status"] == "CROSS_ASSET_VALIDATION_INSUFFICIENT"
+    assert equity_only["asset_classes_without_a_qualifying_candidate"] == (
+        "CRYPTO",
+        "ETF",
+    )
+
+    all_classes = _exit_policy_v2_multi_asset_qualification(
+        [row(asset_class, "balanced") for asset_class in required_classes],
+        required_asset_classes=required_classes,
+    )
+    assert all_classes["status"] == "CROSS_ASSET_VALIDATION_QUALIFIED"
+    assert all_classes["cross_asset_qualified_candidate_bundle_ids"] == ("balanced",)
 
 
 def test_exit_policy_v2_requires_frozen_parameter_bundle_before_execution() -> None:

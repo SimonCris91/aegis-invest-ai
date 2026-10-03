@@ -5,6 +5,7 @@ import pytest
 
 from app.config.models import RiskPolicyConfig
 from app.domain.enums import (
+    Currency,
     RiskDecisionStatus,
     RiskViolationCode,
     SettlementType,
@@ -52,6 +53,7 @@ def test_risk_manager_owns_sizing_inside_authorized_capital_envelope(
         context.model_copy(
             update={
                 "capital_envelope": AuthorizedCapitalEnvelope(
+                    currency=proposal.currency,
                     authorized_capital_eur=Decimal("15"),
                     managed_exposure_eur=Decimal("12"),
                 )
@@ -85,6 +87,7 @@ def test_authorized_capital_cannot_be_double_spent(
     context: RiskContext,
 ) -> None:
     envelope = AuthorizedCapitalEnvelope(
+        currency=proposal.currency,
         authorized_capital_eur=Decimal("15"), managed_exposure_eur=Decimal("12")
     )
     first = risk_manager.evaluate_with_authorized_capital(
@@ -271,7 +274,7 @@ def test_maximum_single_position_exposure_is_twenty_five_percent(
     assert RiskViolationCode.MAX_POSITION_EXPOSURE_EXCEEDED in violation_codes(evaluation)
 
 
-def test_minimum_cash_reserve_is_ten_percent(
+def test_minimum_cash_reserve_is_seven_percent(
     risk_manager: RiskManager,
     proposal: TradeProposal,
     context: RiskContext,
@@ -282,21 +285,26 @@ def test_minimum_cash_reserve_is_ten_percent(
         instrument_id=OTHER_TEST_INSTRUMENT_ID,
         symbol="OTHER",
         settlement_type=SettlementType.REAL,
-        units=Decimal("15.5"),
+        units=Decimal("15.6"),
         average_entry_price=Decimal("10"),
         market_price=Decimal("10"),
     )
-    low_cash = portfolio.model_copy(
+    at_reserve = portfolio.model_copy(
         update={
-            "cash": Decimal("25"),
+            "cash": Decimal("24"),
             "positions": (portfolio.positions[0], large_other),
             "reported_total_value": Decimal("200"),
         }
     )
 
-    evaluation = risk_manager.evaluate(proposal, context.model_copy(update={"portfolio": low_cash}))
+    allowed = risk_manager.evaluate(proposal, context.model_copy(update={"portfolio": at_reserve}))
+    below_reserve = at_reserve.model_copy(update={"cash": Decimal("23.99")})
+    rejected = risk_manager.evaluate(
+        proposal, context.model_copy(update={"portfolio": below_reserve})
+    )
 
-    assert RiskViolationCode.MIN_CASH_RESERVE_BREACHED in violation_codes(evaluation)
+    assert RiskViolationCode.MIN_CASH_RESERVE_BREACHED not in violation_codes(allowed)
+    assert RiskViolationCode.MIN_CASH_RESERVE_BREACHED in violation_codes(rejected)
 
 
 def test_maximum_daily_new_trades_is_three(
@@ -393,6 +401,21 @@ def test_inconsistent_portfolio_state_is_rejected(
     )
 
     assert RiskViolationCode.INCONSISTENT_PORTFOLIO_STATE in violation_codes(evaluation)
+
+
+def test_allows_bounded_broker_rounding_across_positions(
+    risk_manager: RiskManager,
+    proposal: TradeProposal,
+    context: RiskContext,
+    portfolio: PortfolioSnapshot,
+) -> None:
+    rounded = portfolio.model_copy(update={"reported_total_value": Decimal("200.02")})
+
+    evaluation = risk_manager.evaluate(
+        proposal, context.model_copy(update={"portfolio": rounded})
+    )
+
+    assert RiskViolationCode.INCONSISTENT_PORTFOLIO_STATE not in violation_codes(evaluation)
 
 
 def test_inconsistent_api_state_is_rejected(
@@ -572,5 +595,21 @@ def test_currency_mismatch_is_rejected(
     mismatch = proposal.model_copy(update={"currency": Currency.EUR})
 
     evaluation = risk_manager.evaluate(mismatch, context)
+
+    assert RiskViolationCode.CURRENCY_MISMATCH in violation_codes(evaluation)
+
+
+def test_authorized_capital_currency_must_match_demo_account(
+    risk_manager: RiskManager, proposal: TradeProposal, context: RiskContext
+) -> None:
+    envelope = AuthorizedCapitalEnvelope(
+        currency=Currency.EUR,
+        authorized_capital_eur=Decimal("100"),
+        managed_exposure_eur=Decimal("0"),
+    )
+    evaluation = risk_manager.evaluate_with_authorized_capital(
+        proposal,
+        context.model_copy(update={"capital_envelope": envelope}),
+    )
 
     assert RiskViolationCode.CURRENCY_MISMATCH in violation_codes(evaluation)

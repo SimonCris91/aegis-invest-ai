@@ -8,6 +8,7 @@ from app.domain.enums import (
     AIProviderMode,
     BrokerExecutionMode,
     BrokerProviderMode,
+    Currency,
     Environment,
     EtoroTransportMode,
     ExecutionPolicy,
@@ -41,7 +42,7 @@ class RiskPolicyConfig(BaseModel):
 
     max_single_position: Decimal = Field(default=Decimal("0.25"), gt=0, lt=1)
     max_trade_size: Decimal = Field(default=Decimal("0.10"), gt=0, lt=1)
-    min_cash_reserve: Decimal = Field(default=Decimal("0.10"), ge=0, lt=1)
+    min_cash_reserve: Decimal = Field(default=Decimal("0.07"), ge=0, lt=1)
     max_daily_new_trades: int = Field(default=3, ge=0)
     minimum_confidence: Decimal = Field(default=Decimal("0.70"), ge=0, le=1)
     max_price_age_seconds: int = Field(default=300, gt=0)
@@ -140,7 +141,10 @@ class ApplicationConfig(BaseModel):
     environment: Environment = Environment.DEMO
     operating_mode: OperatingMode = OperatingMode.OFFLINE_PAPER
     initial_capital_eur: Decimal = Field(default=Decimal("200"), gt=0)
+    # Kept under the legacy field name for config/API compatibility; the
+    # explicit currency below is authoritative for all live comparisons.
     authorized_capital_eur: Decimal | None = Field(default=None, gt=0)
+    authorized_capital_currency: Currency = Currency.EUR
     target_allocations: TargetAllocations = Field(default_factory=TargetAllocations)
     risk: RiskPolicyConfig = Field(default_factory=RiskPolicyConfig)
     strategy: AegisStrategyConfig = Field(default_factory=AegisStrategyConfig)
@@ -157,6 +161,11 @@ class ApplicationConfig(BaseModel):
     execution_policy: ExecutionPolicy = ExecutionPolicy.ADVISORY
     broker_execution_mode: BrokerExecutionMode = BrokerExecutionMode.READ_ONLY
     log_level: str = "INFO"
+
+    @property
+    def authorized_capital(self) -> Decimal | None:
+        """Configured authorization amount in ``authorized_capital_currency``."""
+        return self.authorized_capital_eur
 
     @model_validator(mode="after")
     def enforce_demo_only_build(self) -> "ApplicationConfig":

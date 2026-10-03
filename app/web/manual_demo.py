@@ -290,8 +290,15 @@ class ManualDemoOrders:
             # Full close is the safe default. Partial close sends the verified
             # units explicitly and is allowed only when the residual/amount
             # checks above pass.
-            payload = {"UnitsToDeduct": float(units) if ticket.get("close_partial") else None}
-            ticket = {**ticket, "units": str(units), "close_partial": bool(ticket.get("close_partial"))}
+            payload = {
+                "InstrumentId": iid,
+                "UnitsToDeduct": float(units) if ticket.get("close_partial") else None,
+            }
+            ticket = {
+                **ticket,
+                "units": str(units),
+                "close_partial": bool(ticket.get("close_partial")),
+            }
         if price <= 0:
             raise ManualOrderError("Prezzo non valido.")
         return (
@@ -347,19 +354,49 @@ class ManualDemoOrders:
             orders.append(
                 {
                     "preview_id": str(oid),
+                    "source": "MANUAL_USER_DIRECTED",
+                    "statistics_scope": "EXCLUDED_FROM_AEGIS",
                     "side": ticket.get("side"),
                     "symbol": ticket.get("symbol"),
                     "instrument_id": ticket.get("instrument_id"),
-                    "position_id": ticket.get("position_id"),
+                    "position_id": result.get("broker_position_id") or ticket.get("position_id"),
                     "amount": ticket.get("amount"),
                     "units": ticket.get("units"),
                     "status": result.get("status", state),
                     "broker_order_id": result.get("broker_order_id"),
+                    "broker_lookup_http_status": result.get("broker_lookup_http_status"),
+                    "broker_lookup_checked_at": result.get("broker_lookup_checked_at"),
                     "message": result.get("message"),
                     "created_at": datetime.fromtimestamp(float(created), UTC).isoformat(),
                 }
             )
         return {"status": "LOCAL_ORDER_LEDGER", "orders": orders, "broker_write_calls": 0}
+
+    def aegis_statistics_excluded_position_ids(self) -> set[str]:
+        """Return only confirmed manually controlled positions, read-only.
+
+        A manual order must never become an Aegis trade merely because both
+        paths use the same Demo account.  The caller uses these IDs solely to
+        exclude them from the Aegis performance attribution.
+        """
+        try:
+            with self._db() as db:
+                rows = db.execute(
+                    "SELECT ticket, result FROM manual_orders WHERE state='FILLED'"
+                ).fetchall()
+        except sqlite3.Error:
+            return set()
+        ids: set[str] = set()
+        for raw_ticket, raw_result in rows:
+            try:
+                ticket = json.loads(raw_ticket)
+                result = json.loads(raw_result) if raw_result else {}
+            except (TypeError, ValueError):
+                continue
+            position_id = result.get("broker_position_id") or ticket.get("position_id")
+            if isinstance(position_id, (str, int)) and str(position_id).isdigit():
+                ids.add(str(position_id))
+        return ids
 
     def status(self, data):
         if not isinstance(data, dict) or set(data) != {"preview_id"}:
@@ -376,7 +413,13 @@ class ManualDemoOrders:
             if row[2]
             else {"status": row[1], "message": "Invio in verifica. Non ripetere l'ordine."}
         )
-        if result.get("broker_order_id") and row[1] in {"SUBMITTED", "PENDING", "PARTIALLY_FILLED"}:
+        if result.get("broker_order_id") and row[1] in {
+            "SUBMITTED",
+            "PENDING",
+            "PARTIALLY_FILLED",
+            "UNCONFIRMED",
+            "UNKNOWN",
+        }:
             client, _, _, settings = self.factory()
             identity = client.identity()
             if (settings.expected_gcid and identity.stable_user_id != settings.expected_gcid) or (
@@ -385,39 +428,84 @@ class ManualDemoOrders:
             ):
                 raise ManualOrderError("Identità del conto cambiata.")
             ticket = json.loads(row[0])
+            order_id = str(result["broker_order_id"])
+            lookup_details = getattr(client, "demo_order_lookup_details", None)
+            lookup = getattr(client, "demo_order_lookup", None)
+            details: dict[str, object] = {}
+            lookup_error: dict[str, str] | None = None
             try:
-                state = client.demo_order_state(
-                    identity, ticket["instrument_id"], result["broker_order_id"]
-                ).value
-            except EtoroApiError:
-                # A broker order ID that is absent from the reconciliation
-                # payload is not evidence of a fill. Keep it blocked, but
-                # expose the honest state to the UI instead of claiming that
-                # the order is still broker-pending.
+                if callable(lookup_details):
+                    raw_details = lookup_details(order_id)
+                    details = raw_details if isinstance(raw_details, dict) else {}
+                    observed = details.get("state", "UNKNOWN")
+                elif callable(lookup):
+                    # The order-level GET is authoritative even after a fill
+                    # disappears from the instrument breakdown. Never turn an
+                    # unknown response into a fill or resend the order.
+                    observed = lookup(order_id)
+                else:
+                    # Compatibility for older/test clients only.
+                    observed = client.demo_order_state(
+                        identity, ticket["instrument_id"], order_id
+                    )
+                state = str(getattr(observed, "value", observed)).upper()
+            except EtoroApiError as exc:
+                state = "UNKNOWN"
+                lookup_error = exc.safe_metadata()
+            except (RuntimeError, TypeError, ValueError):
+                state = "UNKNOWN"
+
+            allowed_states = {
+                "SUBMITTED",
+                "PENDING",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "REJECTED",
+                "CANCELLED",
+            }
+            if state not in allowed_states:
                 state = "UNCONFIRMED"
+                checked_at = self.clock().isoformat()
+                result.update(status=state, broker_lookup_checked_at=checked_at)
+                http_status = lookup_error.get("http_status") if lookup_error else None
+                if http_status is not None:
+                    result["broker_lookup_http_status"] = http_status
+                if http_status == "404":
+                    result["message"] = (
+                        f"Ordine Demo {order_id}: la verifica eToro ha restituito HTTP 404. "
+                        "L'esito resta non confermato: non reinviare."
+                    )
+                elif http_status is not None:
+                    result["message"] = (
+                        f"Ordine Demo {order_id}: verifica eToro non riuscita (HTTP "
+                        f"{http_status}). Esito non confermato: non reinviare."
+                    )
+                else:
+                    result["message"] = (
+                        f"Ordine Demo {order_id}: eToro non ha restituito uno stato "
+                        "esplicito. Esito non confermato: non reinviare."
+                    )
+            else:
                 result.update(
                     status=state,
-                    message=(
-                        f"Ordine Demo {result['broker_order_id']} accettato, ma "
-                        "eToro non ha riconciliato l'esito. La posizione è ancora aperta; "
-                        "non ripetere l'ordine."
-                    ),
+                    broker_lookup_checked_at=self.clock().isoformat(),
+                    broker_lookup_http_status=None,
+                    message=f"Ordine Demo {order_id}: {state}.",
                 )
-                with self._db() as db:
-                    db.execute(
-                        "UPDATE manual_orders SET state=?, result=? WHERE id=?",
-                        (state, json.dumps(result), str(data["preview_id"])),
+                if state == "FILLED":
+                    position_id = details.get("position_id")
+                    executed_exposure = details.get(
+                        "executed_exposure_account_currency"
                     )
-                return result
-            if state != "UNKNOWN":
-                result.update(
-                    status=state, message=f"Ordine Demo {result['broker_order_id']}: {state}."
+                    if isinstance(position_id, str) and position_id.isdigit():
+                        result["broker_position_id"] = position_id
+                    if isinstance(executed_exposure, str):
+                        result["executed_exposure_account_currency"] = executed_exposure
+            with self._db() as db:
+                db.execute(
+                    "UPDATE manual_orders SET state=?, result=? WHERE id=?",
+                    (state, json.dumps(result), str(data["preview_id"])),
                 )
-                with self._db() as db:
-                    db.execute(
-                        "UPDATE manual_orders SET state=?, result=? WHERE id=?",
-                        (state, json.dumps(result), str(data["preview_id"])),
-                    )
         return result
 
     def submit(self, data):
@@ -449,7 +537,8 @@ class ManualDemoOrders:
             ticket = json.loads(row[0])
             pending = db.execute(
                 "SELECT id, ticket FROM manual_orders WHERE state IN "
-                "('SENDING','UNKNOWN','SUBMITTED','UNCONFIRMED','PENDING','PARTIALLY_FILLED') LIMIT 1"
+                "('SENDING','UNKNOWN','SUBMITTED','UNCONFIRMED','PENDING','PARTIALLY_FILLED') "
+                "LIMIT 1"
             ).fetchone()
             pending_ticket = json.loads(pending[1]) if pending else None
             close_after_open = (

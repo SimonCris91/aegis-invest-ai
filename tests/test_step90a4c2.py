@@ -85,6 +85,31 @@ def test_bootstrap_then_same_bar_is_no_cycle(tmp_path: Path) -> None:
     assert store.watermarks() == {("BTC", "1H"): BASE}
 
 
+def test_universe_reconciliation_never_reads_entire_history(tmp_path: Path, monkeypatch) -> None:
+    instrument = _instrument("BTC", AssetClass.CRYPTO)
+    store = ActiveIntelligenceAuditStore(SqliteRecordStore(tmp_path / "cycles.sqlite3"))
+    scanner = CountingScanner()
+    orchestrator = AegisActiveIntelligenceOrchestrator(
+        scanner=cast(Any, scanner), audit_store=store
+    )
+
+    def reject_bulk_history() -> None:
+        raise AssertionError("unbounded history read")
+
+    monkeypatch.setattr(store, "cycles", reject_bulk_history)
+    arguments = dict(
+        scheduled_at=BASE,
+        instruments=(instrument,),
+        bars_by_symbol={"BTC": _bars(instrument, BASE, 60)},
+        portfolio=_portfolio(BASE),
+        timeframe=TimeFrame.ONE_HOUR,
+        force_universe_reconciliation=True,
+    )
+    assert orchestrator.run_if_new_bar_cycle(**arguments) is not None
+    assert orchestrator.run_if_new_bar_cycle(**arguments) is None
+    assert scanner.calls == 1
+
+
 def test_future_or_regressed_bar_does_not_trigger(tmp_path: Path) -> None:
     instrument = _instrument("BTC", AssetClass.CRYPTO)
     store = ActiveIntelligenceAuditStore(SqliteRecordStore(tmp_path / "cycles.sqlite3"))

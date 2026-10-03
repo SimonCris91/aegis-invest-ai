@@ -30,7 +30,6 @@ DIAGNOSTIC_RESPONSE_HEADERS = {
     "x-request-id",
 }
 
-
 @dataclass(frozen=True, slots=True)
 class HttpResponse:
     status: int
@@ -56,6 +55,16 @@ class TransportFailureDetail(StrEnum):
     CONNECTION_RESET = "CONNECTION_RESET"
     PROXY_NETWORK_POLICY = "PROXY_NETWORK_POLICY"
     OTHER_TRANSPORT = "OTHER_TRANSPORT"
+
+
+RETRYABLE_READ_TRANSPORT_DETAILS = frozenset(
+    {
+        TransportFailureDetail.DNS,
+        TransportFailureDetail.SOCKET_CONNECT,
+        TransportFailureDetail.TIMEOUT,
+        TransportFailureDetail.CONNECTION_RESET,
+    }
+)
 
 
 class TransportError(RuntimeError):
@@ -132,7 +141,18 @@ class DisciplinedHttpClient:
     def get(self, url: str, headers: dict[str, str]) -> HttpResponse:
         response: HttpResponse | None = None
         for attempt in range(self._max_read_attempts):
-            response = self._transport.request("GET", url, self._request_headers(url, headers))
+            try:
+                response = self._transport.request(
+                    "GET", url, self._request_headers(url, headers)
+                )
+            except TransportError as exc:
+                if (
+                    attempt + 1 >= self._max_read_attempts
+                    or exc.detail not in RETRYABLE_READ_TRANSPORT_DETAILS
+                ):
+                    raise
+                self._sleeper(min(0.25 * (2**attempt), 1.0))
+                continue
             if response.status not in {429, 500, 502, 503, 504}:
                 return response
             if attempt + 1 < self._max_read_attempts:
@@ -164,9 +184,18 @@ class DisciplinedHttpClient:
         response: HttpResponse | None = None
         request_headers = {**headers, "Content-Type": "application/json"}
         for attempt in range(self._max_read_attempts):
-            response = self._transport.request(
-                "POST", url, self._request_headers(url, request_headers), encoded
-            )
+            try:
+                response = self._transport.request(
+                    "POST", url, self._request_headers(url, request_headers), encoded
+                )
+            except TransportError as exc:
+                if (
+                    attempt + 1 >= self._max_read_attempts
+                    or exc.detail not in RETRYABLE_READ_TRANSPORT_DETAILS
+                ):
+                    raise
+                self._sleeper(min(0.25 * (2**attempt), 1.0))
+                continue
             if response.status not in {429, 500, 502, 503, 504}:
                 return response
             if attempt + 1 < self._max_read_attempts:

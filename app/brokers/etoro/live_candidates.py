@@ -1,5 +1,6 @@
 """Current supported candidates from live search joined to the complete catalog."""
 
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -113,16 +114,39 @@ def current_catalog_candidates(
     excluded_ids: set[str] = set()
     conflict_fields: dict[str, set[str]] = {}
     candidates: list[UniversalInstrument] = []
-    # Crypto first, then numeric broker ID: stable and independent of old candidates.
-    catalog_ids = sorted(
-        catalog, key=lambda i: (_catalog_asset_class(catalog[i]) != "CRYPTO", int(i))
-    )
+    # Interleave supported classes before pagination; a crypto-heavy first
+    # batch must not monopolize the bounded live session checks.
+    catalog_by_class: dict[str, list[str]] = {}
+    for instrument_id, item in catalog.items():
+        catalog_by_class.setdefault(_catalog_asset_class(item), []).append(instrument_id)
+    for ids in catalog_by_class.values():
+        ids.sort(key=int)
+    class_order = [
+        asset_class
+        for asset_class in ("EQUITY", "ETF", "CRYPTO")
+        if asset_class in catalog_by_class
+    ]
+    catalog_ids: list[str] = []
+    class_index = 0
+    while class_order:
+        next_class_order: list[str] = []
+        for asset_class in class_order:
+            ids = catalog_by_class[asset_class]
+            if class_index < len(ids):
+                catalog_ids.append(ids[class_index])
+            if class_index + 1 < len(ids):
+                next_class_order.append(asset_class)
+        class_order = next_class_order
+        class_index += 1
     catalog_ids = catalog_ids[catalog_offset : catalog_offset + live_get_cap]
     batch_catalog_count = len(catalog_ids)
     batch_end_offset = catalog_offset + batch_catalog_count
     stats["batch_catalog_count"] = batch_catalog_count
     stats["batch_end_offset"] = batch_end_offset
     stats["catalog_exhausted"] = batch_end_offset >= prefilter_count
+    stats["batch_asset_class_counts"] = dict(
+        sorted(Counter(_catalog_asset_class(catalog[iid]) for iid in catalog_ids).items())
+    )
     for offset in range(len(catalog_ids)):
         requested_ids = catalog_ids[offset : offset + 1]
         session_report: dict[str, object] = {

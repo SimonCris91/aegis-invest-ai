@@ -17,7 +17,8 @@ from app.domain.base import FrozenDomainModel, require_aware
 from app.domain.enums import AssetClass
 from app.domain.universe import UniversalInstrument
 
-NEWS_INTELLIGENCE_VERSION = "global-news-intelligence-v1"
+NEWS_INTELLIGENCE_VERSION = "global-news-intelligence-v3"
+NEWS_FRESH_MAX_AGE = timedelta(hours=6)
 
 
 class NewsSentiment(StrEnum):
@@ -60,20 +61,25 @@ class NewsProviderError(RuntimeError):
         http_status: int | None = None,
         sanitized_endpoint: str | None = None,
         provider_error_message: str | None = None,
+        retry_after: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.http_status = http_status
         self.sanitized_endpoint = sanitized_endpoint
         self.provider_error_message = provider_error_message
+        self.retry_after = retry_after[:80] if retry_after is not None else None
 
     def safe_diagnostics(self) -> dict[str, object]:
-        return {
+        diagnostics = {
             "status": self.status.value,
             "http_status": self.http_status,
             "sanitized_endpoint": self.sanitized_endpoint,
             "provider_error_message": self.provider_error_message,
         }
+        if self.retry_after is not None:
+            diagnostics["retry_after"] = self.retry_after
+        return diagnostics
 
 
 class NewsSourceQuality(StrEnum):
@@ -116,6 +122,7 @@ class RawNewsItem(FrozenDomainModel):
     language: str = Field(default="en", min_length=2)
     geographic_scope: str = Field(default="GLOBAL", min_length=1)
     summary: str | None = Field(default=None, min_length=1)
+    provider_symbols: tuple[str, ...] = ()
     source_quality: NewsSourceQuality = NewsSourceQuality.UNKNOWN_LOW_CONFIDENCE
     provider: str = Field(default="unknown", min_length=1)
 
@@ -188,6 +195,9 @@ class AssetNewsContext(FrozenDomainModel):
     strongest_negative_event: str | None = None
     aggregate_sentiment: NewsSentiment
     aggregate_relevance: Decimal = Field(ge=0, le=1)
+    aggregate_confidence: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    aggregate_source_reliability: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    aggregate_impact: Decimal = Field(default=Decimal("0"), ge=0, le=1)
     event_risk: Decimal = Field(ge=0, le=1)
     conflicting_news: bool
     latest_material_event_timestamp: datetime | None = None
@@ -371,16 +381,46 @@ class GlobalNewsIntelligenceEngine:
         first_seen_at: datetime,
     ) -> NormalizedGlobalNewsEvent:
         headline = sanitize_external_text(item.headline, maximum_length=280)
-        text = f"{headline} {item.summary or ''}"
-        category = _classify_category(text)
-        sentiment = _classify_sentiment(text)
-        links = _link_assets(text=text, category=category, instruments=instruments)
-        sectors = _sectors_for_links(links, text)
+        summary = sanitize_external_text(item.summary, maximum_length=1200) if item.summary else ""
+        category = _classify_category(headline)
+        if category is GlobalNewsEventCategory.OTHER and summary:
+            category = _classify_category(summary)
+        sentiment = _classify_sentiment(headline)
+        if sentiment is NewsSentiment.NEUTRAL and summary:
+            sentiment = _classify_sentiment(summary)
+        links = _link_assets(text=headline, category=category, instruments=instruments)
+        link_evidence = headline
+        if summary:
+            summary_links = _link_assets(text=summary, category=category, instruments=instruments)
+            links = _dedupe_links((*links, *summary_links))
+            link_evidence = f"{headline} {summary}"
+        # Alpaca supplies exact article tickers independently of prose. Keep
+        # this evidence outside the bounded summary, and match only the source
+        # symbols supplied by the caller (which verifies broker aliases).
+        if (
+            item.provider in {"ALPACA_NEWS", "GOOGLE_NEWS_RSS"}
+            and item.provider_symbols
+            and item.source_quality
+            in {NewsSourceQuality.MAJOR_FINANCIAL_NEWS, NewsSourceQuality.SECONDARY_MEDIA}
+        ):
+            provider_symbols = set(item.provider_symbols)
+            explicit_links = tuple(
+                NewsAssetLink(
+                    symbol=instrument.symbol,
+                    asset_class=instrument.asset_class,
+                    reason="provider article symbol metadata",
+                    confidence=Decimal("0.95"),
+                )
+                for instrument in instruments
+                if instrument.symbol in provider_symbols
+            )
+            links = _dedupe_links((*links, *explicit_links))
+        sectors = _sectors_for_links(links, link_evidence)
         asset_classes = tuple(
             sorted({link.asset_class for link in links}, key=lambda value: value.value)
         )
         source_score = _source_reliability(item.source_quality)
-        impact = _impact_score(category, links)
+        impact = _impact_score(category)
         relevance = max((link.confidence for link in links), default=Decimal("0.35"))
         confidence = _bounded((source_score + relevance + impact) / Decimal("3"))
         event_id = _stable_id(
@@ -399,7 +439,7 @@ class GlobalNewsIntelligenceEngine:
             first_seen_at=first_seen_at,
             language=item.language,
             geographic_scope=item.geographic_scope,
-            named_entities=_named_entities(text, instruments),
+            named_entities=_named_entities(link_evidence, instruments),
             companies_assets_affected=links,
             sectors_affected=sectors,
             asset_classes_affected=asset_classes,
@@ -482,6 +522,21 @@ def _asset_context(
         sum((cluster.canonical_event.relevance_score for cluster in relevant), Decimal("0"))
         / Decimal(max(len(relevant), 1))
     )
+    aggregate_confidence = _bounded(
+        sum((cluster.canonical_event.confidence for cluster in relevant), Decimal("0"))
+        / Decimal(max(len(relevant), 1))
+    )
+    aggregate_source_reliability = _bounded(
+        sum(
+            (cluster.canonical_event.source_reliability_score for cluster in relevant),
+            Decimal("0"),
+        )
+        / Decimal(max(len(relevant), 1))
+    )
+    aggregate_impact = max(
+        (cluster.canonical_event.impact_score for cluster in relevant),
+        default=Decimal("0"),
+    )
     sentiment = _aggregate_sentiment(positives=positives, negatives=negatives, total=len(relevant))
     freshness = _news_freshness(latest=latest, as_of=as_of)
     high_impact = tuple(c for c in relevant if c.canonical_event.impact_score >= Decimal("0.70"))
@@ -495,6 +550,9 @@ def _asset_context(
         strongest_negative_event=_strongest(negatives),
         aggregate_sentiment=sentiment,
         aggregate_relevance=aggregate_relevance,
+        aggregate_confidence=aggregate_confidence,
+        aggregate_source_reliability=aggregate_source_reliability,
+        aggregate_impact=aggregate_impact,
         event_risk=max((c.canonical_event.impact_score for c in negatives), default=Decimal("0")),
         conflicting_news=bool(positives and negatives),
         latest_material_event_timestamp=latest,
@@ -504,7 +562,8 @@ def _asset_context(
             sorted({c.canonical_event.event_category.value for c in high_impact if c in negatives})
         ),
         explanation=(
-            "news context is observational only; it cannot execute trades or bypass RiskManager"
+            "asset-linked news affects the score only through its configured low weight; "
+            "it cannot execute trades or bypass RiskManager"
         ),
     )
 
@@ -642,12 +701,11 @@ def _link_assets(
     category: GlobalNewsEventCategory,
     instruments: tuple[UniversalInstrument, ...],
 ) -> tuple[NewsAssetLink, ...]:
-    lowered = text.casefold()
     links: list[NewsAssetLink] = []
     for instrument in instruments:
-        symbol_match = re.search(rf"\b{re.escape(instrument.symbol.casefold())}\b", lowered)
-        name_match = bool(instrument.display_name and instrument.display_name.casefold() in lowered)
-        alias_match = _company_alias_for_symbol(instrument.symbol) in lowered
+        symbol_match = _explicit_symbol_mention(instrument.symbol, text)
+        name_match = _instrument_name_mention(instrument.display_name, instrument.symbol, text)
+        alias_match = _explicit_phrase_mention(_company_alias_for_symbol(instrument.symbol), text)
         if symbol_match or name_match or alias_match:
             links.append(
                 NewsAssetLink(
@@ -657,27 +715,9 @@ def _link_assets(
                     confidence=Decimal("0.95"),
                 )
             )
-    if category in {
-        GlobalNewsEventCategory.CENTRAL_BANK,
-        GlobalNewsEventCategory.INTEREST_RATES,
-        GlobalNewsEventCategory.INFLATION,
-        GlobalNewsEventCategory.EMPLOYMENT,
-        GlobalNewsEventCategory.MACRO,
-    }:
-        for instrument in instruments:
-            if instrument.asset_class is AssetClass.ETF or instrument.symbol in {
-                "GLD",
-                "BTC",
-                "ETH",
-            }:
-                links.append(
-                    NewsAssetLink(
-                        symbol=instrument.symbol,
-                        asset_class=instrument.asset_class,
-                        reason=f"macro/rates event linked to {instrument.asset_class.value}",
-                        confidence=Decimal("0.60"),
-                    )
-                )
+    # Broad macro/geopolitical headlines remain in GlobalRiskSnapshot. They
+    # are not evidence about every ETF or crypto in the universe; linking them
+    # to thousands of instruments inflated per-asset news scores and payloads.
     if category is GlobalNewsEventCategory.ENERGY:
         for instrument in instruments:
             if instrument.symbol in {"XOM", "XLE"}:
@@ -689,36 +729,85 @@ def _link_assets(
                         confidence=Decimal("0.70"),
                     )
                 )
-    if category in {GlobalNewsEventCategory.CRYPTO, GlobalNewsEventCategory.MARKET_STRESS}:
-        for instrument in instruments:
-            if instrument.asset_class is AssetClass.CRYPTO:
-                links.append(
-                    NewsAssetLink(
-                        symbol=instrument.symbol,
-                        asset_class=instrument.asset_class,
-                        reason="crypto event linked to crypto asset class",
-                        confidence=Decimal("0.70"),
-                    )
-                )
-    if category in {
-        GlobalNewsEventCategory.GEOPOLITICS,
-        GlobalNewsEventCategory.SUPPLY_CHAIN,
-        GlobalNewsEventCategory.NATURAL_DISASTER,
-    }:
-        for instrument in instruments:
-            if instrument.asset_class in {AssetClass.ETF, AssetClass.CRYPTO}:
-                links.append(
-                    NewsAssetLink(
-                        symbol=instrument.symbol,
-                        asset_class=instrument.asset_class,
-                        reason=(
-                            "global geopolitical/supply risk linked to diversified "
-                            "or digital exposure"
-                        ),
-                        confidence=Decimal("0.55"),
-                    )
-                )
     return _dedupe_links(tuple(links))
+
+
+_AMBIGUOUS_ASSET_WORDS = frozenset(
+    {
+        "SAFE",
+        "GOLD",
+        "ALL",
+        "ONE",
+        "NEAR",
+        "LINK",
+        "FLOW",
+        "GAS",
+        "SUN",
+        "CORE",
+        "ROSE",
+        "SAND",
+        "MASK",
+        "CAKE",
+        "STORY",
+        "MOVEMENT",
+        "RENDER",
+    }
+)
+
+
+def _qualified_asset_mention(name: str, text: str, *, ignore_case: bool = False) -> bool:
+    """Require local financial identity, not a common word elsewhere in a headline."""
+    token = re.escape(name.strip())
+    flags = re.IGNORECASE if ignore_case else 0
+    # Explicit cashtags are issuer/asset notation, even for one-letter tickers.
+    if re.search(rf"(?<!\w)\${token}(?!\w)", text, flags=flags):
+        return True
+    if re.search(rf"\b(?:NASDAQ|NYSE|ASX|LSE)\s*:\s*{token}(?!\w)", text, flags=flags):
+        return True
+    financial_noun = r"(?i:shares?|stocks?|tokens?|crypto(?:currency)?|blockchain|protocol|ETF)"
+    return bool(
+        re.search(rf"(?<!\w){token}(?!\w)\s+{financial_noun}\b", text, flags=flags)
+        or re.search(rf"\b{financial_noun}\s+(?:(?i:of|in)\s+)?{token}(?!\w)", text, flags=flags)
+    )
+
+
+def _instrument_name_mention(name: str | None, symbol: str, text: str) -> bool:
+    if not name:
+        return False
+    normalized = name.strip().upper()
+    if (
+        len(normalized) <= 2
+        or normalized == symbol.strip().upper()
+        or normalized in _AMBIGUOUS_ASSET_WORDS
+    ):
+        return _qualified_asset_mention(name, text, ignore_case=True)
+    return _explicit_phrase_mention(name, text)
+
+
+def _explicit_symbol_mention(symbol: str, text: str) -> bool:
+    """Match a ticker as a token without treating short common words as news."""
+    normalized = symbol.strip().upper()
+    if not normalized:
+        return False
+    if len(normalized) <= 2 or normalized in _AMBIGUOUS_ASSET_WORDS:
+        return _qualified_asset_mention(normalized, text)
+    # Tickers of every length collide with ordinary headline words (e.g.
+    # SAFE, GOLD, or VISA). Match exact uppercase ticker notation; issuer
+    # display names and known aliases are checked independently, case-insensitively.
+    return re.search(rf"(?<!\w){re.escape(normalized)}(?!\w)", text) is not None
+
+
+def _explicit_phrase_mention(phrase: str | None, text: str) -> bool:
+    if not phrase or phrase.startswith("__no_alias_for_"):
+        return False
+    return (
+        re.search(
+            rf"(?<!\w){re.escape(phrase.strip())}(?!\w)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _company_alias_for_symbol(symbol: str) -> str:
@@ -784,7 +873,7 @@ def _named_entities(text: str, instruments: tuple[UniversalInstrument, ...]) -> 
     entities = {
         instrument.symbol
         for instrument in instruments
-        if re.search(rf"\b{re.escape(instrument.symbol)}\b", text, flags=re.IGNORECASE)
+        if _explicit_symbol_mention(instrument.symbol, text)
     }
     for term in ("Federal Reserve", "ECB", "SEC", "OPEC", "Apple", "Microsoft"):
         if term.casefold() in text.casefold():
@@ -803,7 +892,7 @@ def _source_reliability(quality: NewsSourceQuality) -> Decimal:
     }[quality]
 
 
-def _impact_score(category: GlobalNewsEventCategory, links: tuple[NewsAssetLink, ...]) -> Decimal:
+def _impact_score(category: GlobalNewsEventCategory) -> Decimal:
     base = {
         GlobalNewsEventCategory.CENTRAL_BANK: Decimal("0.85"),
         GlobalNewsEventCategory.INTEREST_RATES: Decimal("0.85"),
@@ -814,8 +903,8 @@ def _impact_score(category: GlobalNewsEventCategory, links: tuple[NewsAssetLink,
         GlobalNewsEventCategory.GEOPOLITICS: Decimal("0.75"),
         GlobalNewsEventCategory.ENERGY: Decimal("0.70"),
     }.get(category, Decimal("0.50"))
-    if not links:
-        base -= Decimal("0.15")
+    # Event impact is global; lack of a defensible per-asset link must not
+    # erase material macro/geopolitical risk from the global dashboard.
     return _bounded(base)
 
 
@@ -843,7 +932,7 @@ def _news_freshness(*, latest: datetime | None, as_of: datetime) -> NewsFreshnes
     if latest is None:
         return NewsFreshnessStatus.NEWS_SOURCE_UNAVAILABLE
     age = as_of - latest
-    if age <= timedelta(hours=6):
+    if age <= NEWS_FRESH_MAX_AGE:
         return NewsFreshnessStatus.NEWS_FRESH
     if age <= timedelta(days=2):
         return NewsFreshnessStatus.NEWS_DELAYED

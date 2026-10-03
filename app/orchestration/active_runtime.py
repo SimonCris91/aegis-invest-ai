@@ -11,11 +11,12 @@ from collections import Counter
 from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from time import sleep
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Protocol, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -35,13 +36,15 @@ from app.brokers.etoro.demo_preflight import (
     _portfolio_from_demo_snapshot,
     _preflight_market_status,
 )
-from app.brokers.etoro.http import DisciplinedHttpClient, UrllibTransport
+from app.brokers.etoro.http import DisciplinedHttpClient, HttpResponse, UrllibTransport
 from app.brokers.etoro.mapping import (
+    EtoroEligibilityDenied,
+    EtoroMappingError,
     asset_class_from_etoro_instrument_type,
     classify_etoro_instrument_metadata,
 )
-from app.brokers.etoro.runtime import runtime_credentials
-from app.brokers.models import BrokerIdentity, ExecutionState
+from app.brokers.etoro.runtime import runtime_credentials, runtime_settings
+from app.brokers.models import BrokerIdentity, DemoPortfolioSnapshot, ExecutionState
 from app.brokers.preflight import evaluate_demo_preflight
 from app.config.models import ApplicationConfig
 from app.data.historical.cache import HistoricalDataCache
@@ -67,28 +70,32 @@ from app.domain.proposals import TradeProposal
 from app.domain.risk import AuthorizedCapitalEnvelope, RiskContext
 from app.domain.universe import UniversalInstrument
 from app.execution.gate import RiskEnforcedExecutionGate
-from app.intelligence.models import FeatureQuality, MarketBar, TimeFrame
+from app.intelligence.models import AegisDecision, FeatureQuality, MarketBar, TimeFrame
 from app.intelligence.confidence import (
     CONFIDENCE_MODEL_V2_B,
     CONFIDENCE_SEMANTICS_V2,
     V2_B_THRESHOLD,
     V2_B_THRESHOLD_PROVENANCE,
 )
-from app.news.alpaca import AlpacaNewsProvider
+from app.news.alpaca import AlpacaNewsProvider, alpaca_news_symbol
 from app.news.alpha_vantage import AlphaVantageNewsProvider
 from app.news.crosscheck import CrossCheckedNewsProvider
+from app.news.gdelt import GdeltNewsProvider
 from app.news.intelligence import (
     GlobalNewsIntelligenceEngine,
     NewsFeedProvider,
     NewsSourceQuality,
     RawNewsItem,
 )
+from app.news.web_rss import BingNewsRssProvider, GoogleNewsRssProvider
+from app.news.relay import publish as publish_secondary_news, read_latest as read_secondary_news, relay_key, relay_store_path
 from app.orchestration.active_intelligence import (
     ActiveIntelligenceAuditStore,
     ActiveIntelligenceCycleRecord,
     AegisActiveIntelligenceOrchestrator,
     _news_asset_contexts,
     _news_event_digest,
+    _persistable_news_asset_contexts,
     causal_completed_bars,
     default_active_intelligence_audit_store,
 )
@@ -96,26 +103,70 @@ from app.orchestration.market_acquisition import (
     EtoroOneHourAcquisitionCoordinator,
     build_coherent_one_hour_snapshot,
 )
+from app.policies.defaults import default_asset_policy_engine
 from app.risk.kill_switch import KillSwitch
 from app.risk.manager import RiskManager
 from app.scanner.active import (
     ActiveScannerBucket,
+    ActiveScannerCandidate,
     ActiveMarketScanner,
     ActiveScannerResult,
     _expected_completed_one_hour_bar_timestamp,
-    _is_market_closed_as_of,
+    _market_closed_for_instrument,
 )
 from app.storage.sqlite import RunnerLease, SqliteRecordStore
 
 DEFAULT_ETORO_FULL_CATALOG_SESSION_AUDIT_PATH = (
     Path("work") / "etoro-full-catalog-session-audit.json"
 )
+_RUNTIME_GDELT_PROVIDER: GdeltNewsProvider | None = None
+_RUNTIME_GDELT_PROVIDER_LOCK = Lock()
+_RUNTIME_CANDIDATE_GDELT_PROVIDERS: dict[str, GdeltNewsProvider] = {}
+_RUNTIME_CANDIDATE_GDELT_PROVIDER_LOCK = Lock()
+_RUNTIME_CANDIDATE_GDELT_PROVIDER_LIMIT = 8
+_RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS: dict[str, GoogleNewsRssProvider] = {}
+_RUNTIME_CANDIDATE_WEB_RSS_PROVIDER_LOCK = Lock()
+_RUNTIME_CANDIDATE_WEB_RSS_PROVIDER_LIMIT = 16
 RUNNER_LEASE_DURATION = timedelta(minutes=15)
-# The Demo authorization is an account-currency envelope. The configured
-# single-entry ceiling is intentionally kept separate from the total envelope
-# so a confirmed Demo cycle cannot exceed the explicitly authorized amount.
+# Limits are expressed in the account currency. No implicit FX conversion is
+# performed; a cap/account mismatch blocks execution.
 MIN_DEMO_AUTHORIZED_CAPITAL = Decimal("200")
-DEMO_MAX_SINGLE_ORDER_AMOUNT = Decimal("98000")
+MAX_AEGIS_MANAGED_EXPOSURE_EUR = Decimal("200")
+MAX_AEGIS_MANAGED_EXPOSURE_USD = Decimal("98000")
+MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY = {
+    Currency.EUR: MAX_AEGIS_MANAGED_EXPOSURE_EUR,
+    Currency.USD: MAX_AEGIS_MANAGED_EXPOSURE_USD,
+}
+
+
+def effective_aegis_managed_exposure_limit(
+    authorized_capital: Decimal | None,
+    currency: Currency = Currency.EUR,
+) -> Decimal | None:
+    """Apply the currency-specific project Demo ceiling to the configured budget."""
+    if authorized_capital is None:
+        return None
+    currency_limit = MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY.get(currency)
+    if currency_limit is None:
+        return None
+    return min(authorized_capital, currency_limit)
+
+
+def _capped_demo_pilot_settings(
+    values: Mapping[str, str],
+    *,
+    authorized_capital_eur: Decimal | None,
+    authorized_capital_currency: Currency = Currency.EUR,
+) -> EtoroDemoPilotSettings:
+    settings = demo_pilot_settings(values, currency=authorized_capital_currency)
+    limit = effective_aegis_managed_exposure_limit(
+        authorized_capital_eur, authorized_capital_currency
+    )
+    if limit is None:
+        return EtoroDemoPilotSettings(enabled=False, notional_eur=None)
+    if settings.notional_eur is None:
+        return settings
+    return settings.model_copy(update={"notional_eur": min(settings.notional_eur, limit)})
 
 
 class CausalActiveCycleProducer(Protocol):
@@ -289,7 +340,7 @@ def _refresh_active_one_hour_bars(
         market_closed = instrument.asset_class in {
             AssetClass.EQUITY,
             AssetClass.ETF,
-        } and _is_market_closed_as_of(as_of)
+        } and _market_closed_for_instrument(instrument=instrument, as_of=as_of)
         if market_closed and latest is not None:
             outcomes[instrument.key] = {
                 "instrument": instrument,
@@ -422,6 +473,19 @@ ETORO_DEMO_RUNTIME_STATUS_KIND = "etoro-demo-runtime-status"
 DEFAULT_ETORO_DEMO_RUNTIME_STORE_PATH = Path("work") / "etoro-demo-runtime.sqlite3"
 
 
+def _acquisition_audit_summary(acquisition: Mapping[str, object]) -> dict[str, object]:
+    """Persist aggregate acquisition telemetry, not every instrument result.
+
+    The complete per-instrument rows remain available to the current cycle;
+    repeating them in the audit store made each poll several megabytes.
+    """
+    summary = {key: value for key, value in acquisition.items() if key != "acquisition_results"}
+    rows = acquisition.get("acquisition_results")
+    if isinstance(rows, (list, tuple)):
+        summary["acquisition_results_count"] = len(rows)
+    return summary
+
+
 class AegisEtoroAutomaticDemoRuntime:
     """Single runtime owner that may consume accepted A4C cycles for Demo only."""
 
@@ -528,11 +592,29 @@ class AegisEtoroAutomaticDemoRuntime:
                     ),
                 }
             )
+        # The global feed supplies macro context, but a candidate may still
+        # lack an asset-linked article.  Before RiskManager evaluates an
+        # executable candidate, make one bounded, read-only GDELT lookup for
+        # the small candidate set.  Missing evidence remains a hard reject.
+        cycle = _enrich_candidate_news_with_gdelt(
+            cycle=cycle,
+            scanner_result=scanner_result,
+            instruments=instruments,
+            enabled=self._values.get("AEGIS_NEWS_GDELT_ENABLED", "false"),
+            values=self._values,
+        )
+        cycle = _merge_secondary_news_into_cycle(
+            cycle=cycle,
+            instruments=instruments,
+            values=self._values,
+        )
+        relay_status = publish_secondary_news(cycle, self._values)
         if not scanner_result.top_opportunities and not scanner_result.watchlist:
             return _demo_runtime_payload(
                 status="NO_TOP_OPPORTUNITY",
                 pilot_enabled=self._config.etoro_demo_automatic_pilot_enabled,
                 cycle_id=cycle.cycle_id,
+                secondary_news_relay=relay_status,
                 **_cycle_news_payload(cycle),
             )
         if not self._config.etoro_demo_automatic_pilot_enabled:
@@ -543,6 +625,7 @@ class AegisEtoroAutomaticDemoRuntime:
                 top_opportunity_count=len(scanner_result.top_opportunities),
                 eligible_count=len(scanner_result.top_opportunities),
                 **_cycle_news_payload(cycle),
+                secondary_news_relay=relay_status,
             )
         if self._config.broker_execution_mode is not BrokerExecutionMode.DEMO_EXECUTION:
             return _demo_runtime_payload(
@@ -553,6 +636,7 @@ class AegisEtoroAutomaticDemoRuntime:
                 top_opportunity_count=len(scanner_result.top_opportunities),
                 eligible_count=len(scanner_result.top_opportunities),
                 **_cycle_news_payload(cycle),
+                secondary_news_relay=relay_status,
             )
         if self._config.execution_policy is not ExecutionPolicy.AUTONOMOUS:
             return _demo_runtime_payload(
@@ -563,6 +647,7 @@ class AegisEtoroAutomaticDemoRuntime:
                 top_opportunity_count=len(scanner_result.top_opportunities),
                 eligible_count=len(scanner_result.top_opportunities),
                 **_cycle_news_payload(cycle),
+                secondary_news_relay=relay_status,
             )
         if self._config.kill_switch:
             return _demo_runtime_payload(
@@ -597,10 +682,16 @@ class AegisEtoroAutomaticDemoRuntime:
                     cycle_id=cycle.cycle_id,
                     top_opportunity_count=len(scanner_result.top_opportunities),
                     eligible_count=0,
+                    scanner_asset_class_counts=_scanner_asset_class_counts(scanner_result),
                     blockers=coverage_blockers,
+                    secondary_news_relay=relay_status,
                     **_cycle_news_payload(cycle),
                 )
-        settings = demo_pilot_settings(self._values)
+        settings = _capped_demo_pilot_settings(
+            self._values,
+            authorized_capital_eur=self._config.authorized_capital,
+            authorized_capital_currency=self._config.authorized_capital_currency,
+        )
         pilot = EtoroAutomaticDemoPilot(
             environment=self._config.operating_mode,
             settings=settings,
@@ -619,12 +710,67 @@ class AegisEtoroAutomaticDemoRuntime:
             submission_packages=packages,
             allow_exploratory_watchlist=True,
         )
+        # A TOP candidate can be a valid intelligence result and still be
+        # rejected by the execution RiskManager (for example because its
+        # confidence is below the execution threshold).  Previously that
+        # stopped the whole Demo lane even when a coherent WATCHLIST fallback
+        # was package-ready.  If no broker write happened, give the explicit
+        # Demo exploratory lane one bounded attempt with the same hard gates.
+        # This never relabels a WATCHLIST item as TOP and never retries after
+        # an ambiguous/rejected broker write.
+        if (
+            result.demo_broker_write_calls == 0
+            and not any(item.submitted for item in result.submissions)
+            and scanner_result.top_opportunities
+            and scanner_result.watchlist
+        ):
+            exploratory_scanner_result = scanner_result.model_copy(
+                update={"top_opportunities": ()}
+            )
+            fallback_result = pilot.run(
+                cycle=cycle,
+                scanner_result=exploratory_scanner_result,
+                broker_instrument_ids=_verified_broker_ids(instruments),
+                submission_packages=packages,
+                allow_exploratory_watchlist=True,
+            )
+            if any(item.submitted for item in fallback_result.submissions):
+                result = fallback_result
+            else:
+                result = fallback_result.model_copy(
+                    update={
+                        "blockers": tuple(
+                            dict.fromkeys((*result.blockers, *fallback_result.blockers))
+                        ),
+                        "eligible_intents": (
+                            *result.eligible_intents,
+                            *fallback_result.eligible_intents,
+                        ),
+                        "submissions": (*result.submissions, *fallback_result.submissions),
+                        "demo_broker_write_calls": (
+                            result.demo_broker_write_calls
+                            + fallback_result.demo_broker_write_calls
+                        ),
+                        "broker_write_calls_real": (
+                            result.broker_write_calls_real
+                            + fallback_result.broker_write_calls_real
+                        ),
+                    }
+                )
+        candidate_execution_diagnostics = _candidate_execution_diagnostics(
+            cycle=cycle,
+            scanner_result=scanner_result,
+            package_diagnostics={symbol: "PACKAGE_READY" for symbol in packages},
+            quote_diagnostics={},
+            pilot_result=result,
+        )
         return _demo_runtime_payload(
             status=result.status.value,
             pilot_enabled=True,
             cycle_id=cycle.cycle_id,
             top_opportunity_count=len(scanner_result.top_opportunities),
             eligible_count=len(result.eligible_intents),
+            scanner_asset_class_counts=_scanner_asset_class_counts(scanner_result),
             submitted_count=sum(1 for item in result.submissions if item.submitted),
             blockers=tuple(item.value for item in result.blockers),
             demo_broker_write_calls=result.demo_broker_write_calls,
@@ -633,6 +779,7 @@ class AegisEtoroAutomaticDemoRuntime:
             execution_admission_gate_reached=any(
                 item.execution_admission_gate_reached for item in result.submissions
             ),
+            candidate_execution_diagnostics=candidate_execution_diagnostics,
             pilot_result=result,
             news_provider=cycle.news_provider,
             news_provider_status=cycle.news_provider_status,
@@ -645,6 +792,10 @@ class AegisEtoroAutomaticDemoRuntime:
             news_acquisition_error_code=cycle.news_acquisition_error_code,
             news_acquisition_error_detail_safe=cycle.news_acquisition_error_detail_safe,
             news_provider_diagnostics=cycle.news_provider_diagnostics,
+            news_event_digest=cycle.news_event_digest,
+            news_asset_contexts=cycle.news_asset_contexts,
+            global_risk_context=cycle.global_risk_context,
+            secondary_news_relay=relay_status,
         )
 
 
@@ -714,10 +865,26 @@ class EtoroDemoContinuousRunner:
         state = "RUNNING"
         poll_count = 0
         accepted_count = 0
-        demo_writes = 0
-        real_writes = 0
+        previous_status = (
+            SqliteRecordStore.read_latest_read_only(
+                self._status_store.path, ETORO_DEMO_RUNTIME_STATUS_KIND
+            )
+            if self._status_store is not None
+            else None
+        )
+        # Keep persisted write counters monotonic across runner restarts. These
+        # are broker write calls, not successful fills or open positions.
+        demo_writes = _nonnegative_int(
+            (previous_status or {}).get("demo_broker_write_calls")
+        )
+        real_writes = _nonnegative_int(
+            (previous_status or {}).get("broker_write_calls_real")
+        )
         last_poll_at: datetime | None = None
-        last_accepted_at: str | None = None
+        previous_scan_at = (previous_status or {}).get("last_successful_scan_at")
+        last_accepted_at: str | None = (
+            previous_scan_at if isinstance(previous_scan_at, str) else None
+        )
         last_result: Mapping[str, object] | None = None
         last_error: str | None = None
         heartbeat_stop = Event()
@@ -761,11 +928,19 @@ class EtoroDemoContinuousRunner:
             last_poll_at = self._clock()
             poll_count += 1
             if lease is not None:
-                heartbeat_ok = self._status_store.heartbeat_runner_lease(  # type: ignore[union-attr]
-                    lease=lease,
-                    heartbeat_at=last_poll_at,
-                    expires_at=last_poll_at + RUNNER_LEASE_DURATION,
-                )
+                try:
+                    heartbeat_ok = self._status_store.heartbeat_runner_lease(  # type: ignore[union-attr]
+                        lease=lease,
+                        heartbeat_at=last_poll_at,
+                        expires_at=last_poll_at + RUNNER_LEASE_DURATION,
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not _is_transient_sqlite_lock(exc):
+                        raise
+                    # The independent heartbeat thread keeps retrying. A
+                    # temporary diagnostic read lock must not terminate the
+                    # market runner or create a false lease-loss event.
+                    heartbeat_ok = True
                 if not heartbeat_ok:
                     state = "LEASE_LOST"
                     last_error = "RUNNER_LEASE_LOST"
@@ -854,7 +1029,7 @@ class EtoroDemoContinuousRunner:
         if lease is not None:
             self._status_store.release_runner_lease(  # type: ignore[union-attr]
                 lease=lease,
-                released_at=last_poll_at or self._clock(),
+                released_at=self._clock(),
             )
         return {
             "runner_state": state,
@@ -893,10 +1068,79 @@ class EtoroDemoContinuousRunner:
     ) -> None:
         if self._status_store is None:
             return
-        result = last_result or {}
-        cycle_state = result.get("status")
+        # A NO_CYCLE poll is a heartbeat, not a new market/news evaluation.
+        # Merge it over the last stored result so waiting for a new bar does
+        # not erase the most recent scan, news digest, or blocker diagnostics.
+        previous = SqliteRecordStore.read_latest_read_only(
+            self._status_store.path, ETORO_DEMO_RUNTIME_STATUS_KIND
+        ) or {}
+        result = dict(previous)
+        if last_result is not None:
+            if last_result.get("status") == "NO_CYCLE":
+                # Heartbeats may carry model defaults such as empty news lists
+                # or zero candidate counts. They are not new evaluations and
+                # must not erase the last completed scan. Merge only fields
+                # that can change between market bars.
+                heartbeat_fields = {
+                    "status",
+                    "pilot_enabled",
+                    "demo_execution_enabled",
+                    "execution_enabled",
+                    "execution_available",
+                    "real_execution_available",
+                    "broker_write",
+                    "demo_broker_write_calls",
+                    "broker_write_calls_real",
+                    "demo_exit",
+                    "demo_reconciliation_report",
+                    "acquisition_attempted",
+                    "acquisition_provider",
+                    "acquisition_instruments_requested",
+                    "acquisition_instruments_updated",
+                    "acquisition_instruments_attempted",
+                    "acquisition_instruments_not_attempted",
+                    "acquisition_instruments_in_backoff",
+                    "acquisition_newest_completed_bar",
+                    "acquisition_stale_count",
+                    "acquisition_missing_count",
+                    "acquisition_status",
+                    "acquisition_error",
+                    "acquisition_outcome_counts",
+                }
+                if last_result.get("news_scan_completed_at"):
+                    heartbeat_fields.update(
+                        key
+                        for key in last_result
+                        if key.startswith("news_") or key == "global_risk_context"
+                    )
+                result.update(
+                    {
+                        key: value
+                        for key, value in last_result.items()
+                        if key in heartbeat_fields
+                    }
+                )
+            else:
+                # A new evaluated cycle replaces the previous result. Do not
+                # carry a legacy A4C/coverage explanation forward when the
+                # current result has reached the scanner and reports a
+                # different set of blockers (for example RiskManager or
+                # Demo preflight). NO_CYCLE heartbeats intentionally preserve
+                # the last completed evaluation above.
+                if "a4c_reason" not in last_result:
+                    result.pop("a4c_reason", None)
+                result.update(last_result)
+            # Legacy persisted rows may pair an A4C failure with a later
+            # scanner-reached result because NO_CYCLE heartbeats preserve the
+            # last snapshot. Once a scanner result is present, A4C succeeded;
+            # the stale upstream reason must not mask current execution gates.
+            if result.get("scanner_reached") is True:
+                result.pop("a4c_reason", None)
+        cycle_state = result.get("status", result.get("cycle_state"))
         activity = (
-            "WAITING_FOR_ELIGIBLE_COMPLETED_BAR" if cycle_state == "NO_CYCLE" else cycle_state
+            "WAITING_FOR_ELIGIBLE_COMPLETED_BAR"
+            if cycle_state == "NO_CYCLE"
+            else cycle_state or result.get("activity_code")
         )
         universe = result.get("universe")
         universe_status = universe if isinstance(universe, Mapping) else {}
@@ -918,28 +1162,77 @@ class EtoroDemoContinuousRunner:
             except (OSError, ValueError, TypeError):
                 if not universe_status:
                     universe_status = {}
-        self._status_store.append(
-            ETORO_DEMO_RUNTIME_STATUS_KIND,
-            {
+        pilot_diagnostics: list[dict[str, object]] = []
+        raw_pilot_result = result.get("pilot_result")
+        if isinstance(raw_pilot_result, Mapping):
+            raw_submissions = raw_pilot_result.get("submissions", ())
+            if isinstance(raw_submissions, (list, tuple)):
+                for raw_submission in raw_submissions:
+                    if not isinstance(raw_submission, Mapping):
+                        continue
+                    pilot_diagnostics.append(
+                        {
+                            "symbol": raw_submission.get("symbol"),
+                            "asset_class": raw_submission.get("asset_class"),
+                            "status": raw_submission.get("sanitized_status"),
+                            "submitted": bool(raw_submission.get("submitted", False)),
+                            "risk_violation_codes": tuple(
+                                str(code)
+                                for code in raw_submission.get("risk_violation_codes", ())
+                            ),
+                            "preflight_reasons": tuple(
+                                str(reason)
+                                for reason in raw_submission.get("preflight_reasons", ())
+                            ),
+                        }
+                    )
+        status_payload = {
                 "observed_at": observed_at.isoformat(),
                 "runner_state": state,
                 "cycle_state": cycle_state,
                 "last_successful_scan_at": last_accepted_at,
                 "top_opportunity_count": _nonnegative_int(result.get("top_opportunity_count")),
-                "eligible_demo_candidates": _nonnegative_int(result.get("eligible_count")),
+                "eligible_demo_candidates": _nonnegative_int(
+                    result.get("eligible_count", result.get("eligible_demo_candidates"))
+                ),
+                "scanner_asset_class_counts": result.get("scanner_asset_class_counts", {}),
                 "automatic_pilot_armed": bool(result.get("pilot_enabled", False)),
                 "execution_enabled": bool(result.get("execution_enabled", False)),
-                "last_submission_status": result.get("status"),
+                "last_submission_status": (
+                    result.get("last_submission_status")
+                    if result.get("status") == "NO_CYCLE"
+                    else result.get("status", result.get("last_submission_status"))
+                ),
                 "demo_broker_write_calls": demo_writes,
+                "demo_broker_write_calls_last_poll": (
+                    0
+                    if last_result is None or last_result.get("status") == "NO_CYCLE"
+                    else _nonnegative_int(last_result.get("demo_broker_write_calls"))
+                ),
                 "execution_available": bool(result.get("execution_available", False)),
                 "broker_write_calls_real": real_writes,
+                "broker_write_calls_real_last_poll": (
+                    0
+                    if last_result is None or last_result.get("status") == "NO_CYCLE"
+                    else _nonnegative_int(last_result.get("broker_write_calls_real"))
+                ),
                 "activity_code": activity,
                 "last_error": last_error,
                 "poll_count": poll_count,
                 "pilot_notional_eur": result.get("pilot_notional_eur"),
+                "pilot_notional": result.get("pilot_notional"),
+                "pilot_notional_currency": result.get("pilot_notional_currency"),
                 "authorized_capital_eur": result.get("authorized_capital_eur"),
+                "authorized_capital": result.get("authorized_capital"),
+                "authorized_capital_currency": result.get("authorized_capital_currency"),
+                "demo_account_currency": result.get("demo_account_currency"),
+                "managed_exposure_limit_eur": result.get("managed_exposure_limit_eur"),
+                "managed_exposure_limit": result.get("managed_exposure_limit"),
+                "managed_exposure_currency": result.get("managed_exposure_currency"),
                 "managed_exposure_eur": result.get("managed_exposure_eur"),
+                "managed_exposure": result.get("managed_exposure"),
                 "remaining_authorized_capital_eur": result.get("remaining_authorized_capital_eur"),
+                "remaining_authorized_capital": result.get("remaining_authorized_capital"),
                 "sizing_mode": result.get("sizing_mode"),
                 "active_scanner_universe_count": result.get("active_scanner_universe_count"),
                 "validated_baseline_count": result.get("validated_baseline_count"),
@@ -964,7 +1257,9 @@ class EtoroDemoContinuousRunner:
                 "news_provider_diagnostics": result.get("news_provider_diagnostics", {}),
                 "news_provider_request_count": result.get("news_provider_request_count", 0),
                 "news_event_digest": result.get("news_event_digest", ()),
-                "news_asset_contexts": result.get("news_asset_contexts", {}),
+                "news_asset_contexts": _persistable_news_asset_contexts(
+                    result.get("news_asset_contexts", {}), preserve_payload=True
+                ),
                 "global_risk_context": result.get("global_risk_context", {}),
                 "acquisition_attempted": result.get("acquisition_attempted", False),
                 "acquisition_provider": result.get("acquisition_provider"),
@@ -995,6 +1290,16 @@ class EtoroDemoContinuousRunner:
                 "package_material_diagnostics": result.get(
                     "package_material_diagnostics", {}
                 ),
+                "quote_freshness_diagnostics": result.get(
+                    "quote_freshness_diagnostics", {}
+                ),
+                "candidate_execution_diagnostics": result.get(
+                    "candidate_execution_diagnostics", ()
+                ),
+                "package_sizing_diagnostics": result.get(
+                    "package_sizing_diagnostics", {}
+                ),
+                "pilot_diagnostics": tuple(pilot_diagnostics),
                 "pilot_result": result.get("pilot_result"),
                 "scanner_reached": result.get("scanner_reached", False),
                 "news_reached": result.get("news_reached", False),
@@ -1002,8 +1307,15 @@ class EtoroDemoContinuousRunner:
                 "execution_admission_gate_reached": result.get(
                     "execution_admission_gate_reached", False
                 ),
-            },
-        )
+            }
+        try:
+            self._status_store.append(ETORO_DEMO_RUNTIME_STATUS_KIND, status_payload)
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_lock(exc):
+                raise
+            # Status is observability, not execution admission. Preserve the
+            # live runner and let the next heartbeat/poll persist a snapshot.
+            return
 
 
 def read_etoro_demo_runtime_status(
@@ -1102,13 +1414,29 @@ def etoro_demo_runtime_status(
         "observed_at": status.get("observed_at"),
         "cycle_state": status.get("cycle_state"),
         "poll_count": status.get("poll_count"),
-        "broker_write_calls": 0,
+        "broker_write_calls": status.get("demo_broker_write_calls", 0),
+        "demo_broker_write_calls": status.get("demo_broker_write_calls", 0),
+        "demo_broker_write_calls_last_poll": status.get(
+            "demo_broker_write_calls_last_poll", 0
+        ),
         "broker_write_calls_real": status.get("broker_write_calls_real", 0),
+        "broker_write_calls_real_last_poll": status.get(
+            "broker_write_calls_real_last_poll", 0
+        ),
     }
 
 
 def _nonnegative_int(value: object) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _is_transient_sqlite_lock(exc: sqlite3.OperationalError) -> bool:
+    detail = str(exc).casefold()
+    return (
+        "database is locked" in detail
+        or "database table is locked" in detail
+        or "database is busy" in detail
+    )
 
 
 class _EtoroReadback:
@@ -1138,6 +1466,7 @@ def _demo_runtime_payload(
     cycle_id: str | None = None,
     top_opportunity_count: int = 0,
     eligible_count: int = 0,
+    scanner_asset_class_counts: Mapping[str, object] | None = None,
     submitted_count: int = 0,
     blockers: tuple[str, ...] = (),
     demo_broker_write_calls: int = 0,
@@ -1146,6 +1475,7 @@ def _demo_runtime_payload(
     execution_admission_gate_reached: bool = False,
     pilot_result: EtoroDemoPilotResult | None = None,
     authorized_capital_eur: Decimal | None = None,
+    authorized_capital_currency: Currency = Currency.EUR,
     news_provider: str | None = None,
     news_provider_status: str | None = None,
     news_scan_cutoff_timestamp: datetime | None = None,
@@ -1157,6 +1487,11 @@ def _demo_runtime_payload(
     news_acquisition_error_code: str | None = None,
     news_acquisition_error_detail_safe: str | None = None,
     news_provider_diagnostics: Mapping[str, object] | None = None,
+    news_event_digest: tuple[dict[str, object], ...] = (),
+    news_asset_contexts: Mapping[str, object] | None = None,
+    global_risk_context: Mapping[str, object] | None = None,
+    secondary_news_relay: Mapping[str, object] | None = None,
+    candidate_execution_diagnostics: tuple[dict[str, object], ...] = (),
 ) -> dict[str, object]:
     return {
         "status": status,
@@ -1164,6 +1499,7 @@ def _demo_runtime_payload(
         "cycle_id": cycle_id,
         "top_opportunity_count": top_opportunity_count,
         "eligible_count": eligible_count,
+        "scanner_asset_class_counts": dict(scanner_asset_class_counts or {}),
         "submitted_count": submitted_count,
         "blockers": blockers,
         "demo_broker_write_calls": demo_broker_write_calls,
@@ -1172,9 +1508,25 @@ def _demo_runtime_payload(
         "execution_admission_gate_reached": execution_admission_gate_reached,
         "write_request_sent_to_real": False,
         "pilot_result": None if pilot_result is None else pilot_result.model_dump(mode="json"),
+        "candidate_execution_diagnostics": candidate_execution_diagnostics,
         "authorized_capital_eur": (
+            None
+            if authorized_capital_eur is None or authorized_capital_currency is not Currency.EUR
+            else str(authorized_capital_eur)
+        ),
+        "authorized_capital": (
             None if authorized_capital_eur is None else str(authorized_capital_eur)
         ),
+        "authorized_capital_currency": authorized_capital_currency.value,
+        "managed_exposure_limit_eur": (
+            str(MAX_AEGIS_MANAGED_EXPOSURE_EUR)
+            if authorized_capital_currency is Currency.EUR
+            else None
+        ),
+        "managed_exposure_limit": str(
+            MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY.get(authorized_capital_currency)
+        ) if authorized_capital_currency in MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY else None,
+        "managed_exposure_currency": authorized_capital_currency.value,
         "sizing_mode": "RISK_MANAGER_AUTHORIZED_CAPITAL",
         "news_provider": news_provider,
         "news_provider_status": news_provider_status,
@@ -1191,6 +1543,10 @@ def _demo_runtime_payload(
         "news_acquisition_error_code": news_acquisition_error_code,
         "news_acquisition_error_detail_safe": news_acquisition_error_detail_safe,
         "news_provider_diagnostics": dict(news_provider_diagnostics or {}),
+        "news_event_digest": tuple(news_event_digest),
+        "news_asset_contexts": dict(news_asset_contexts or {}),
+        "global_risk_context": dict(global_risk_context or {}),
+        "secondary_news_relay": dict(secondary_news_relay or {}),
     }
 
 
@@ -1207,6 +1563,9 @@ def _cycle_news_payload(cycle: ActiveIntelligenceCycleRecord) -> dict[str, Any]:
         "news_acquisition_error_code": cycle.news_acquisition_error_code,
         "news_acquisition_error_detail_safe": cycle.news_acquisition_error_detail_safe,
         "news_provider_diagnostics": cycle.news_provider_diagnostics,
+        "news_event_digest": cycle.news_event_digest,
+        "news_asset_contexts": cycle.news_asset_contexts,
+        "global_risk_context": cycle.global_risk_context,
     }
 
 
@@ -1268,10 +1627,20 @@ def _configured_runtime_block(
             config.etoro_demo_automatic_pilot_enabled if pilot_enabled is None else pilot_enabled
         ),
         blockers=(blocker,),
-        authorized_capital_eur=config.authorized_capital_eur,
+        authorized_capital_eur=config.authorized_capital,
+        authorized_capital_currency=config.authorized_capital_currency,
     )
     payload.update(_runtime_execution_state(config, credentials_present=credentials_present))
     return payload
+
+
+class _DiagnosticReadOnlyHttpClient(DisciplinedHttpClient):
+    """Last-resort guard against eToro broker writes during diagnostics."""
+
+    def post_once(
+        self, url: str, headers: dict[str, str], payload: dict[str, object]
+    ) -> HttpResponse:
+        raise RuntimeError("DIAGNOSTIC_READ_ONLY_BROKER_WRITE_FORBIDDEN")
 
 
 def build_etoro_demo_runtime_once_report(
@@ -1279,6 +1648,7 @@ def build_etoro_demo_runtime_once_report(
     *,
     values: Mapping[str, str],
     clock: Callable[[], datetime] | None = None,
+    diagnostic_read_only: bool = False,
 ) -> dict[str, object]:
     """Execute exactly one configured Demo runtime iteration from cached 1H data."""
     if config.operating_mode is not OperatingMode.ETORO_DEMO:
@@ -1297,11 +1667,11 @@ def build_etoro_demo_runtime_once_report(
         return _configured_runtime_block(
             config, blocker="ETORO_CREDENTIALS_NOT_CONFIGURED", credentials_present=False
         )
-    if config.authorized_capital_eur is None:
+    if config.authorized_capital is None:
         return _configured_runtime_block(
             config, blocker="AUTHORIZED_CAPITAL_NOT_CONFIGURED", credentials_present=True
         )
-    if config.authorized_capital_eur < MIN_DEMO_AUTHORIZED_CAPITAL:
+    if config.authorized_capital < MIN_DEMO_AUTHORIZED_CAPITAL:
         return _configured_runtime_block(
             config,
             blocker="AUTHORIZED_CAPITAL_BELOW_MINIMUM_200",
@@ -1345,25 +1715,62 @@ def build_etoro_demo_runtime_once_report(
                       "reason": "UNSUPPORTED_INTERNAL_INSTRUMENT"}
                      for item in excluded_internal],
     })
-    http = DisciplinedHttpClient(UrllibTransport(config.etoro_transport_mode))
+    http = (
+        _DiagnosticReadOnlyHttpClient(UrllibTransport(config.etoro_transport_mode))
+        if diagnostic_read_only
+        else DisciplinedHttpClient(UrllibTransport(config.etoro_transport_mode))
+    )
     client = EtoroReadClient(credentials, http)
+    try:
+        identity = client.identity()
+        demo_reconciliation_report = _reconcile_unresolved_demo_submissions(
+            registry=registry,
+            client=client,
+            identity=identity,
+            observed_at=scheduled_at,
+        )
+    except (EtoroApiError, RuntimeError, ValueError, TypeError) as exc:
+        identity = None
+        category = getattr(exc, "category", None)
+        demo_reconciliation_report = {
+            "attempted": 0,
+            "verified": 0,
+            "remaining": len(registry.unresolved_demo_submissions()),
+            "errors": (
+                "IDENTITY_READ_FAILED",
+                getattr(exc, "status", None)
+                or getattr(category, "value", None)
+                or type(exc).__name__,
+            ),
+        }
+    registry.append(
+        "etoro-demo-submission-reconciliation",
+        {"observed_at": scheduled_at.isoformat(), **demo_reconciliation_report},
+    )
     # Exit management is intentionally independent from the 1H entry cycle:
     # an open Demo position must still be protected while market coverage is
     # incomplete or the scanner has no new bar.  The manager is Demo-only and
     # keeps a successful/ambiguous close from being replayed automatically.
-    try:
-        demo_exit_report = manage_demo_exits(
-            client=client,
-            identity=client.identity(),
-            credentials=credentials,
-            http=http,
-            registry=registry,
-            observed_at=scheduled_at,
+    if diagnostic_read_only:
+        demo_exit_report = {
+            "enabled": False,
+            "evaluated": 0,
+            "held": 0,
+            "close_triggered": 0,
+            "close_write_calls": 0,
+            "closed_confirmed": 0,
+            "pending_confirmation": 0,
+            "blocked": 0,
+            "errors": (),
+            "reason": "DIAGNOSTIC_READ_ONLY",
+        }
+    elif identity is None:
+        reconciliation_errors = demo_reconciliation_report.get("errors", ())
+        identity_error = (
+            reconciliation_errors[-1]
+            if isinstance(reconciliation_errors, (list, tuple)) and reconciliation_errors
+            else "IDENTITY_UNAVAILABLE"
         )
-    except EtoroApiError as exc:
-        # Exit management must never take the whole read/scanner runner down.
-        # The next poll retries the read, while the open lifecycle record
-        # remains FILLED and therefore keeps its capital reservation.
         demo_exit_report = {
             "enabled": True,
             "evaluated": 0,
@@ -1373,13 +1780,42 @@ def build_etoro_demo_runtime_once_report(
             "closed_confirmed": 0,
             "pending_confirmation": 0,
             "blocked": 1,
-            "errors": ("IDENTITY_READ_FAILED", exc.status or exc.category.value),
+            "errors": ("IDENTITY_READ_FAILED", identity_error),
             "policy": "EXITPOLICY_V2_GUARDED",
         }
+    else:
+        try:
+            demo_exit_report = manage_demo_exits(
+                client=client,
+                identity=identity,
+                credentials=credentials,
+                http=http,
+                registry=registry,
+                observed_at=scheduled_at,
+            )
+        except EtoroApiError as exc:
+            # Exit management must never take the whole read/scanner runner down.
+            # The next poll retries the read, while the open lifecycle record
+            # remains FILLED and therefore keeps its capital reservation.
+            demo_exit_report = {
+                "enabled": True,
+                "evaluated": 0,
+                "held": 0,
+                "close_triggered": 0,
+                "close_write_calls": 0,
+                "closed_confirmed": 0,
+                "pending_confirmation": 0,
+                "blocked": 1,
+                "errors": ("IDENTITY_READ_FAILED", exc.status or exc.category.value),
+                "policy": "EXITPOLICY_V2_GUARDED",
+            }
     registry.append(
         "etoro-demo-exit-management",
         {"observed_at": scheduled_at.isoformat(), **demo_exit_report},
     )
+    # Exit writes happen before the entry scanner and must be counted even
+    # when market coverage blocks the entry cycle later in this poll.
+    exit_write_calls = _nonnegative_int(demo_exit_report.get("close_write_calls"))
     from app.orchestration.session_state import enrich_instrument_session_state
 
     instruments = enrich_instrument_session_state(
@@ -1439,7 +1875,7 @@ def build_etoro_demo_runtime_once_report(
         instruments=instruments,
         as_of=scheduled_at,
     )
-    registry.append("etoro-market-data-acquisition", acquisition)
+    registry.append("etoro-market-data-acquisition", _acquisition_audit_summary(acquisition))
     snapshot = build_coherent_one_hour_snapshot(
         instruments=instruments,
         bars_by_symbol=bars_by_symbol,
@@ -1499,7 +1935,9 @@ def build_etoro_demo_runtime_once_report(
             status="BLOCKED",
             pilot_enabled=True,
             blockers=(coverage_blocker,),
-            authorized_capital_eur=config.authorized_capital_eur,
+            demo_broker_write_calls=exit_write_calls,
+            authorized_capital_eur=config.authorized_capital,
+            authorized_capital_currency=config.authorized_capital_currency,
         )
         blocked_payload.update(acquisition)
         blocked_payload.update(coverage)
@@ -1510,6 +1948,12 @@ def build_etoro_demo_runtime_once_report(
         blocked_payload["scanner_reached"] = False
         blocked_payload["news_reached"] = True
         blocked_payload.update(_runtime_execution_state(config, credentials_present=True))
+        if diagnostic_read_only:
+            blocked_payload.update(
+                diagnostic_read_only=True,
+                execution_enabled=False,
+                execution_available=False,
+            )
         return blocked_payload
     portfolio = PortfolioSnapshot(as_of=scheduled_at, currency=Currency.EUR, cash=Decimal("200"))
     audit_store = default_active_intelligence_audit_store()
@@ -1525,10 +1969,17 @@ def build_etoro_demo_runtime_once_report(
     risk_manager = RiskManager(
         config.risk,
         switch,
+        asset_policy_engine=default_asset_policy_engine(
+            minimum_cash_reserve=config.risk.min_cash_reserve
+        ),
         authorization_key=b"automatic-demo-runtime-risk-authorization-key!",
         clock=effective_clock,
     )
-    execution_available = _demo_execution_available(config, credentials_present=True)
+    execution_available = (
+        not diagnostic_read_only
+        and identity is not None
+        and _demo_execution_available(config, credentials_present=True)
+    )
     gateway = (
         RiskCheckedEtoroDemoSubmissionGateway(
             environment=config.operating_mode,
@@ -1547,6 +1998,8 @@ def build_etoro_demo_runtime_once_report(
         else None
     )
     package_material_diagnostics: dict[str, object] = {}
+    package_sizing_diagnostics: dict[str, object] = {}
+    quote_freshness_diagnostics: dict[str, dict[str, object]] = {}
     runtime = AegisEtoroAutomaticDemoRuntime(
         config=config,
         values=values,
@@ -1558,10 +2011,20 @@ def build_etoro_demo_runtime_once_report(
                 cycle=cycle,
                 scanner_result=result,
                 client=client,
+                instrument_ids_by_symbol=_verified_broker_ids(snapshot.instruments),
                 config=config,
-                settings=demo_pilot_settings(values),
+                settings=_capped_demo_pilot_settings(
+                    values,
+                    authorized_capital_eur=config.authorized_capital,
+                    authorized_capital_currency=config.authorized_capital_currency,
+                ),
                 registry=registry,
                 diagnostics=package_material_diagnostics,
+                sizing_diagnostics=package_sizing_diagnostics,
+                quote_diagnostics=quote_freshness_diagnostics,
+                maximum_future_quote_skew_seconds=(
+                    runtime_settings(values).maximum_future_quote_skew_seconds
+                ),
             )
         )
         if execution_available
@@ -1575,9 +2038,28 @@ def build_etoro_demo_runtime_once_report(
         timeframe=TimeFrame.ONE_HOUR,
         shadow_capital=Decimal("200"),
     )
+    result["demo_broker_write_calls"] = (
+        _nonnegative_int(result.get("demo_broker_write_calls")) + exit_write_calls
+    )
     result.update(acquisition)
     result.update(coverage)
     result["package_material_diagnostics"] = package_material_diagnostics
+    result["package_sizing_diagnostics"] = package_sizing_diagnostics
+    result["quote_freshness_diagnostics"] = quote_freshness_diagnostics
+    candidate_rows = result.get("candidate_execution_diagnostics", ())
+    if isinstance(candidate_rows, (list, tuple)):
+        enriched_rows: list[dict[str, object]] = []
+        for item in candidate_rows:
+            if not isinstance(item, Mapping):
+                continue
+            row = dict(item)
+            symbol = str(row.get("symbol", ""))
+            if symbol in package_material_diagnostics:
+                row["package_status"] = package_material_diagnostics[symbol]
+            if symbol in quote_freshness_diagnostics:
+                row["quote"] = quote_freshness_diagnostics[symbol]
+            enriched_rows.append(row)
+        result["candidate_execution_diagnostics"] = tuple(enriched_rows)
     result["current_spread_assessments"] = quote_report["spread_assessments"]
     result["demo_exit"] = demo_exit_report
     result["scheduled_at"] = scheduled_at.isoformat()
@@ -1586,12 +2068,69 @@ def build_etoro_demo_runtime_once_report(
         "verified execution packages are required; unavailable materials fail closed"
     )
     result.update(_runtime_execution_state(config, credentials_present=True))
+    if diagnostic_read_only:
+        result.update(
+            diagnostic_read_only=True,
+            execution_enabled=False,
+            execution_available=False,
+        )
     result["scanner_reached"] = result.get("cycle_id") is not None
     result["news_reached"] = result.get("news_scan_completed_at") is not None
-    settings = demo_pilot_settings(values)
+    settings = _capped_demo_pilot_settings(
+        values,
+        authorized_capital_eur=config.authorized_capital,
+        authorized_capital_currency=config.authorized_capital_currency,
+    )
     if settings.notional_eur is not None:
-        result["pilot_notional_eur"] = str(settings.notional_eur)
-    result["authorized_capital_eur"] = str(config.authorized_capital_eur)
+        result["pilot_notional"] = str(settings.notional_eur)
+        result["pilot_notional_currency"] = config.authorized_capital_currency.value
+        result["pilot_notional_eur"] = (
+            str(settings.notional_eur)
+            if config.authorized_capital_currency is Currency.EUR
+            else None
+        )
+    result["authorized_capital"] = str(config.authorized_capital)
+    result["authorized_capital_currency"] = config.authorized_capital_currency.value
+    if config.authorized_capital_currency is Currency.EUR:
+        result["authorized_capital_eur"] = str(config.authorized_capital)
+        result["managed_exposure_limit_eur"] = str(MAX_AEGIS_MANAGED_EXPOSURE_EUR)
+    else:
+        result["authorized_capital_eur"] = None
+        result["managed_exposure_limit_eur"] = None
+    result["managed_exposure_limit"] = str(
+        MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY[config.authorized_capital_currency]
+    )
+    result["managed_exposure_currency"] = config.authorized_capital_currency.value
+    managed_exposure_now = registry.managed_demo_exposure(
+        config.authorized_capital_currency
+    )
+    result["managed_exposure"] = (
+        None if managed_exposure_now is None else str(managed_exposure_now)
+    )
+    result["managed_exposure_eur"] = (
+        str(managed_exposure_now)
+        if managed_exposure_now is not None
+        and config.authorized_capital_currency is Currency.EUR
+        else None
+    )
+    remaining_capital_now = (
+        None
+        if managed_exposure_now is None
+        else max(
+            Decimal("0"),
+            Decimal(result["managed_exposure_limit"]) - managed_exposure_now,
+        )
+    )
+    result["remaining_authorized_capital"] = (
+        None if remaining_capital_now is None else str(remaining_capital_now)
+    )
+    result["remaining_authorized_capital_eur"] = (
+        str(remaining_capital_now)
+        if remaining_capital_now is not None
+        and config.authorized_capital_currency is Currency.EUR
+        else None
+    )
+    result["demo_account_currency"] = config.authorized_capital_currency.value
     result["sizing_mode"] = "RISK_MANAGER_AUTHORIZED_CAPITAL"
     result["active_scanner_universe_count"] = len(instruments)
     artifact = read_etoro_dynamic_universe_artifact()
@@ -2453,8 +2992,9 @@ def _demo_execution_available(config: ApplicationConfig, *, credentials_present:
         and config.etoro_demo_execution_enabled
         and config.etoro_demo_automatic_pilot_enabled
         and credentials_present
-        and config.authorized_capital_eur is not None
-        and config.authorized_capital_eur >= MIN_DEMO_AUTHORIZED_CAPITAL
+        and config.authorized_capital is not None
+        and config.authorized_capital >= MIN_DEMO_AUTHORIZED_CAPITAL
+        and config.authorized_capital_currency in MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY
         and not config.kill_switch
     )
 
@@ -2491,6 +3031,7 @@ def build_etoro_demo_runtime_report(
     values: Mapping[str, str],
     clock: Callable[[], datetime] | None = None,
     max_iterations: int | None = None,
+    diagnostic_read_only: bool = False,
 ) -> dict[str, object]:
     """Run the continuous Demo poller around the existing one-shot runtime."""
     poll_interval = _configured_runtime_seconds(
@@ -2504,6 +3045,7 @@ def build_etoro_demo_runtime_report(
             config,
             values=values,
             clock=clock,
+            diagnostic_read_only=diagnostic_read_only,
         ),
         clock=clock,
         poll_interval_seconds=poll_interval,
@@ -2528,18 +3070,21 @@ def build_runtime_news_engine(
     provider_mode = config.providers.news
     if provider_mode is ProviderMode.ALPHA_VANTAGE:
         primary = AlphaVantageNewsProvider(api_key=values.get("ALPHA_VANTAGE_API_KEY"))
+        sources = [primary]
         secondary_name = values.get("AEGIS_NEWS_SECONDARY_PROVIDER", "").strip().lower()
         if secondary_name == "alpaca":
-            secondary = AlpacaNewsProvider(
+            sources.append(AlpacaNewsProvider(
                 api_key_id=_first_nonempty(values, "ALPACA_API_KEY_ID", "APCA_API_KEY_ID"),
                 api_secret_key=_first_nonempty(
                     values, "ALPACA_API_SECRET_KEY", "APCA_API_SECRET_KEY"
                 ),
-            )
-            return GlobalNewsIntelligenceEngine(CrossCheckedNewsProvider(primary, secondary))
-        return GlobalNewsIntelligenceEngine(
-            primary
-        )
+            ))
+        gdelt_enabled = values.get("AEGIS_NEWS_GDELT_ENABLED", "false").strip().lower()
+        if gdelt_enabled in {"1", "true", "yes", "on"}:
+            sources.append(_shared_runtime_gdelt_provider())
+        if len(sources) == 1:
+            return GlobalNewsIntelligenceEngine(primary)
+        return GlobalNewsIntelligenceEngine(CrossCheckedNewsProvider(*sources))
     if provider_mode is ProviderMode.NONE:
         return GlobalNewsIntelligenceEngine(NewsFeedProvider(unavailable=True))
     return GlobalNewsIntelligenceEngine(NewsFeedProvider())
@@ -2551,6 +3096,118 @@ def _first_nonempty(values: Mapping[str, str], *names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _shared_runtime_gdelt_provider() -> GdeltNewsProvider:
+    """Reuse bounded GDELT cache across the runner's per-cycle engine rebuilds."""
+    global _RUNTIME_GDELT_PROVIDER
+    with _RUNTIME_GDELT_PROVIDER_LOCK:
+        if _RUNTIME_GDELT_PROVIDER is None:
+            # Refresh on a slower cadence than scanner polling. Persisted
+            # fallback can survive provider throttling for at most the news
+            # freshness window; GDELT itself filters cached articles by their
+            # publication timestamps before returning them as fallback.
+            _RUNTIME_GDELT_PROVIDER = GdeltNewsProvider(
+                cache_ttl=timedelta(minutes=30),
+                cache_path=Path("work") / "gdelt-news-cache.json",
+            )
+        return _RUNTIME_GDELT_PROVIDER
+
+
+def _shared_candidate_gdelt_provider(*, query: str) -> GdeltNewsProvider:
+    """Reuse the bounded cache and cooldown for an unchanged candidate query.
+
+    Candidate checks run more often than the global news refresh.  Creating a
+    new provider for every poll discarded its cache and its rate-limit
+    cooldown, which could repeatedly hit GDELT for the same candidate set.
+    Keep a small, process-local query cache: it is read-only and cannot affect
+    broker execution other than providing existing evidence to RiskManager.
+    """
+    global _RUNTIME_CANDIDATE_GDELT_PROVIDERS
+    with _RUNTIME_CANDIDATE_GDELT_PROVIDER_LOCK:
+        provider = _RUNTIME_CANDIDATE_GDELT_PROVIDERS.get(query)
+        if provider is not None:
+            return provider
+        if len(_RUNTIME_CANDIDATE_GDELT_PROVIDERS) >= _RUNTIME_CANDIDATE_GDELT_PROVIDER_LIMIT:
+            oldest_query = next(iter(_RUNTIME_CANDIDATE_GDELT_PROVIDERS))
+            _RUNTIME_CANDIDATE_GDELT_PROVIDERS.pop(oldest_query)
+        provider = GdeltNewsProvider(
+            query=query,
+            max_records=25,
+            cache_ttl=timedelta(minutes=10),
+        )
+        _RUNTIME_CANDIDATE_GDELT_PROVIDERS[query] = provider
+        return provider
+
+
+def _candidate_news_search_terms(instrument: UniversalInstrument) -> tuple[str, ...]:
+    """Build bounded web terms, including exchange-qualified Asian tickers.
+
+    Alpaca intentionally rejects non-US suffixes.  For a Tokyo or Hong Kong
+    listing the ticker remains useful to web search, but only with its market
+    context; a bare four-digit code is too ambiguous.  Ordinary short US
+    tickers keep the existing name-only behavior.
+    """
+    value = instrument.display_name or instrument.symbol
+    cleaned_name = " ".join(
+        "".join(
+            character
+            for character in value
+            if character.isalnum() or character in " .-_"
+        ).split()
+    )
+    terms: list[str] = []
+    if cleaned_name:
+        terms.append(cleaned_name)
+    symbol = instrument.symbol.strip().upper()
+    if symbol.endswith(".T"):
+        root = symbol[:-2]
+        terms.extend((symbol, f"{root} Tokyo", f"{root} JPX"))
+    elif symbol.endswith(".HK"):
+        root = symbol[:-3]
+        terms.extend((symbol, f"{root} Hong Kong", f"{root} HKEX"))
+    elif symbol.endswith(".SS") or symbol.endswith(".SZ"):
+        root = symbol[:-3]
+        terms.extend((symbol, f"{root} China"))
+    return tuple(dict.fromkeys(term for term in terms if term))
+
+
+def _web_news_locale(instrument: UniversalInstrument) -> tuple[str, str]:
+    symbol = instrument.symbol.strip().upper()
+    if symbol.endswith(".T"):
+        return "ja-JP", "JP"
+    if symbol.endswith(".HK"):
+        return "en-HK", "HK"
+    return "en-US", "US"
+
+
+def _shared_candidate_web_rss_provider(
+    *,
+    query: str,
+    instrument: UniversalInstrument,
+    source: str = "google",
+) -> GoogleNewsRssProvider:
+    locale, region = _web_news_locale(instrument)
+    source_key = source.strip().lower() or "google"
+    key = f"{source_key}|{query}|{instrument.symbol}|{locale}|{region}"
+    global _RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS
+    with _RUNTIME_CANDIDATE_WEB_RSS_PROVIDER_LOCK:
+        provider = _RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS.get(key)
+        if provider is not None:
+            return provider
+        if len(_RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS) >= _RUNTIME_CANDIDATE_WEB_RSS_PROVIDER_LIMIT:
+            oldest_query = next(iter(_RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS))
+            _RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS.pop(oldest_query)
+        provider_type = BingNewsRssProvider if source_key == "bing" else GoogleNewsRssProvider
+        provider = provider_type(
+            query=query,
+            candidate_symbol=instrument.symbol,
+            locale=locale,
+            region=region,
+            cache_path=Path("work") / "candidate-web-news-cache.json",
+        )
+        _RUNTIME_CANDIDATE_WEB_RSS_PROVIDERS[key] = provider
+        return provider
 
 
 def _alpaca_crypto_market_data_fallback(
@@ -2586,6 +3243,355 @@ def _candidate_news_available(
     return timestamp.tzinfo is not None and timestamp <= cycle.news_cutoff_timestamp
 
 
+def _merge_secondary_news_into_cycle(
+    *,
+    cycle: ActiveIntelligenceCycleRecord,
+    instruments: tuple[UniversalInstrument, ...],
+    values: Mapping[str, str],
+) -> ActiveIntelligenceCycleRecord:
+    """Merge only fresh, class-matched secondary evidence into the cycle."""
+    key = relay_key(values)
+    if key is None:
+        return cycle
+    remote = read_secondary_news(key=key, path=relay_store_path(values), now=cycle.completed_at)
+    if not remote:
+        return cycle
+    by_symbol = {item.symbol: item for item in instruments}
+    merged = dict(cycle.news_asset_contexts)
+    accepted: list[str] = []
+    for symbol, raw_context in remote.get("contexts", {}).items():
+        if not isinstance(symbol, str) or not isinstance(raw_context, Mapping):
+            continue
+        instrument = by_symbol.get(symbol)
+        if instrument is None or raw_context.get("freshness") != "NEWS_FRESH":
+            continue
+        if str(raw_context.get("asset_class", "")) != instrument.asset_class.value:
+            continue
+        latest = raw_context.get("latest_material_event_timestamp")
+        if not isinstance(latest, str):
+            continue
+        try:
+            latest_at = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if latest_at.tzinfo is None or latest_at > cycle.news_cutoff_timestamp:
+            continue
+        local = merged.get(symbol)
+        local_latest = None
+        if isinstance(local, Mapping) and isinstance(local.get("latest_material_event_timestamp"), str):
+            try:
+                local_latest = datetime.fromisoformat(str(local["latest_material_event_timestamp"]).replace("Z", "+00:00"))
+            except ValueError:
+                local_latest = None
+        if local_latest is not None and local_latest.tzinfo is not None and local_latest >= latest_at:
+            continue
+        merged[symbol] = dict(raw_context)
+        accepted.append(symbol)
+    if not accepted:
+        return cycle
+    diagnostics = dict(cycle.news_provider_diagnostics)
+    diagnostics["SECONDARY_NEWS_RELAY"] = {
+        "status": "AVAILABLE",
+        "source_id": remote.get("source_id"),
+        "generated_at": remote.get("generated_at"),
+        "contexts_received": len(remote.get("contexts", {})),
+        "contexts_accepted": len(accepted),
+        "symbols": tuple(sorted(accepted)),
+    }
+    provider = cycle.news_provider
+    if "SECONDARY_NEWS_RELAY" not in provider:
+        provider = f"{provider}+SECONDARY_NEWS_RELAY"
+    status = cycle.news_provider_status
+    if status not in {"AVAILABLE", "PARTIAL"}:
+        status = "PARTIAL"
+    return cycle.model_copy(
+        update={
+            "news_asset_contexts": merged,
+            "news_provider": provider,
+            "news_provider_status": status,
+            "news_provider_diagnostics": diagnostics,
+        }
+    )
+
+
+def _enrich_candidate_news_with_gdelt(
+    *,
+    cycle: ActiveIntelligenceCycleRecord,
+    scanner_result: ActiveScannerResult,
+    instruments: tuple[UniversalInstrument, ...],
+    enabled: str,
+    values: Mapping[str, str] | None = None,
+) -> ActiveIntelligenceCycleRecord:
+    """Add fresh, symbol-linked GDELT evidence for a bounded candidate set.
+
+    This is not a fallback approval path: it only supplies source evidence to
+    the existing RiskManager rule.  If no article is found or the provider is
+    unavailable, the original missing-news rejection remains in force.
+    """
+    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+        return cycle
+    by_symbol = {instrument.symbol: instrument for instrument in instruments}
+    # Persisted scanner snapshots can retain only ``candidates`` and omit the
+    # derived TOP/WATCHLIST collections.  The Demo pilot reconstructs those
+    # buckets earlier in the cycle, but this helper must also work when it is
+    # called directly or with a partially rehydrated snapshot.  Restrict the
+    # canonical list to executable discovery buckets: NO_TRADE/REJECTED must
+    # never trigger a GDELT request.
+    candidates = (*scanner_result.top_opportunities, *scanner_result.watchlist)
+    if not candidates and scanner_result.candidates:
+        candidates = tuple(
+            candidate
+            for candidate in scanner_result.candidates
+            if candidate.bucket
+            in {
+                ActiveScannerBucket.TOP_OPPORTUNITIES,
+                ActiveScannerBucket.WATCHLIST,
+            }
+        )
+    candidates = _fair_execution_candidate_order(tuple(candidates))
+    selected: list[UniversalInstrument] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.symbol in seen or _candidate_news_available(cycle, candidate.symbol):
+            continue
+        instrument = by_symbol.get(candidate.symbol)
+        if instrument is None:
+            continue
+        selected.append(instrument)
+        seen.add(candidate.symbol)
+        if len(selected) == 6:
+            break
+    if not selected:
+        return cycle
+
+    diagnostics = dict(cycle.news_provider_diagnostics)
+    merged_contexts = dict(cycle.news_asset_contexts)
+    fresh_symbols: set[str] = set()
+
+    # Alpaca's news endpoint covers stocks and crypto. Query all supported
+    # candidate classes in one bounded request so crypto does not monopolize
+    # the GDELT fallback while securities wait for a public-provider cooldown.
+    # For crypto, use Alpaca's documented CRYPTO:<symbol> alias to normalize
+    # symbols to the provider's USD-pair convention; restore the canonical
+    # broker symbol only after an exact linked context is established.
+    targeted_news_instruments = tuple(
+        instrument
+        for instrument in selected
+        if instrument.asset_class
+        in {AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO}
+    )
+    alpaca_source_groups: dict[str, list[UniversalInstrument]] = {}
+    unsupported_alpaca_symbols: list[str] = []
+    for instrument in targeted_news_instruments:
+        source_input = (
+            f"CRYPTO:{instrument.symbol}"
+            if instrument.asset_class is AssetClass.CRYPTO
+            else instrument.symbol
+        )
+        source_symbol = alpaca_news_symbol(source_input)
+        if source_symbol is None:
+            unsupported_alpaca_symbols.append(instrument.symbol)
+            continue
+        alpaca_source_groups.setdefault(source_symbol, []).append(instrument)
+    # Only use one-to-one aliases. If multiple broker instruments collapse to
+    # the same provider ticker, leave them for the name-aware GDELT path rather
+    # than attributing one article ambiguously to several candidates.
+    alpaca_aliases = {
+        source_symbol: grouped[0]
+        for source_symbol, grouped in alpaca_source_groups.items()
+        if len(grouped) == 1
+    }
+    ambiguous_alpaca_symbols = tuple(
+        instrument.symbol
+        for grouped in alpaca_source_groups.values()
+        if len(grouped) > 1
+        for instrument in grouped
+    )
+    alpaca_instruments = tuple(
+        instrument.model_copy(update={"symbol": source_symbol})
+        for source_symbol, instrument in alpaca_aliases.items()
+    )
+    api_key_id = _first_nonempty(values or {}, "ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
+    api_secret_key = _first_nonempty(
+        values or {}, "ALPACA_API_SECRET_KEY", "APCA_API_SECRET_KEY"
+    )
+    if alpaca_instruments and api_key_id and api_secret_key:
+        alpaca_result = GlobalNewsIntelligenceEngine(
+            AlpacaNewsProvider(
+                api_key_id=api_key_id,
+                api_secret_key=api_secret_key,
+                symbols=tuple(instrument.symbol for instrument in alpaca_instruments),
+                limit=50,
+                lookback_hours=48,
+            )
+        ).analyze(instruments=alpaca_instruments, as_of=cycle.news_cutoff_timestamp)
+        alpaca_contexts = _news_asset_contexts(alpaca_result)
+        alpaca_fresh: dict[str, dict[str, object]] = {}
+        for source_symbol, instrument in alpaca_aliases.items():
+            context = alpaca_contexts.get(source_symbol)
+            if (
+                isinstance(context, dict)
+                and context.get("freshness") == "NEWS_FRESH"
+                and context.get("latest_material_event_timestamp")
+            ):
+                # Restore the canonical broker symbol after matching the
+                # provider's normalized ticker (for example AMAT.RTH -> AMAT).
+                alpaca_fresh[instrument.symbol] = context
+        merged_contexts.update(alpaca_fresh)
+        fresh_symbols.update(alpaca_fresh)
+        diagnostics["CANDIDATE_ALPACA"] = {
+            "status": alpaca_result.provider_status.value,
+            "candidates_checked": tuple(
+                instrument.symbol for instrument in alpaca_aliases.values()
+            ),
+            "provider_symbols": {
+                instrument.symbol: source_symbol
+                for source_symbol, instrument in alpaca_aliases.items()
+            },
+            "unsupported_symbols": tuple(unsupported_alpaca_symbols),
+            "ambiguous_symbols": ambiguous_alpaca_symbols,
+            "fresh_contexts": tuple(sorted(alpaca_fresh)),
+            "articles_returned": alpaca_result.raw_event_count,
+            "broker_write_calls": 0,
+        }
+
+    remaining_selected = tuple(
+        instrument for instrument in selected if instrument.symbol not in fresh_symbols
+    )
+    terms: list[str] = []
+    for instrument in remaining_selected:
+        # Search the issuer/asset name, while adding an exchange-qualified
+        # ticker for international listings. Bare short US tickers remain
+        # excluded because they collide with ordinary words.
+        for term in _candidate_news_search_terms(instrument):
+            if term not in terms:
+                terms.append(term)
+    if not terms:
+        return cycle.model_copy(
+            update={
+                "news_asset_contexts": merged_contexts,
+                "news_provider_diagnostics": diagnostics,
+            }
+        )
+    query = "(" + " OR ".join(f'\"{term}\"' for term in terms) + ")"
+    provider = _shared_candidate_gdelt_provider(query=query)
+    result = GlobalNewsIntelligenceEngine(provider).analyze(
+        instruments=remaining_selected, as_of=cycle.news_cutoff_timestamp
+    )
+    contexts = _news_asset_contexts(result)
+    fresh_contexts = {
+        symbol: context
+        for symbol, context in contexts.items()
+        if context.get("freshness") == "NEWS_FRESH"
+        and context.get("latest_material_event_timestamp")
+    }
+    merged_contexts.update(fresh_contexts)
+    diagnostics["CANDIDATE_GDELT"] = {
+        "status": result.provider_status.value,
+        "candidates_checked": tuple(instrument.symbol for instrument in remaining_selected),
+        "fresh_contexts": tuple(sorted(fresh_contexts)),
+        "articles_returned": result.raw_event_count,
+        "provider_details": {
+            key: value
+            for key, value in provider.last_diagnostics.items()
+            if key in {
+                "http_status",
+                "provider_error_message",
+                "retry_after_seconds",
+                "cache_hit",
+                "stale_cache_fallback",
+            }
+        },
+        "broker_write_calls": 0,
+    }
+
+    # GDELT and broker APIs do not cover every international listing.  When
+    # there is still no linked context, perform a bounded read-only web search
+    # per remaining candidate.  This is deliberately candidate-specific: a
+    # global headline alone must never satisfy the RiskManager news gate.
+    web_enabled = (
+        values is not None
+        and values.get("AEGIS_NEWS_WEB_SEARCH_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    web_remaining = tuple(
+        instrument for instrument in remaining_selected if instrument.symbol not in fresh_contexts
+    )
+    if web_enabled and web_remaining:
+        web_attempts: list[dict[str, object]] = []
+        web_fresh: dict[str, dict[str, object]] = {}
+        for instrument in web_remaining:
+            candidate_terms = _candidate_news_search_terms(instrument)
+            if not candidate_terms:
+                continue
+            web_query = "(" + " OR ".join(f'\"{term}\"' for term in candidate_terms) + ")"
+            for source in ("google", "bing"):
+                web_provider = _shared_candidate_web_rss_provider(
+                    query=web_query,
+                    instrument=instrument,
+                    source=source,
+                )
+                web_result = GlobalNewsIntelligenceEngine(web_provider).analyze(
+                    instruments=(instrument,), as_of=cycle.news_cutoff_timestamp
+                )
+                candidate_context = _news_asset_contexts(web_result).get(
+                    instrument.symbol, {}
+                )
+                has_fresh_context = (
+                    isinstance(candidate_context, dict)
+                    and candidate_context.get("freshness") == "NEWS_FRESH"
+                    and candidate_context.get("latest_material_event_timestamp")
+                )
+                if has_fresh_context:
+                    web_fresh[instrument.symbol] = candidate_context
+                web_attempts.append(
+                    {
+                        "symbol": instrument.symbol,
+                        "source": source,
+                        "status": web_result.provider_status.value,
+                        "articles_returned": web_result.raw_event_count,
+                        "fresh_context": bool(has_fresh_context),
+                        "locale": web_provider.last_diagnostics.get("locale"),
+                        "region": web_provider.last_diagnostics.get("region"),
+                        "provider_details": {
+                            key: value
+                            for key, value in web_provider.last_diagnostics.items()
+                            if key
+                            in {
+                                "http_status",
+                                "provider_error_message",
+                                "cache_hit",
+                                "locale",
+                                "region",
+                            }
+                        },
+                    }
+                )
+                if has_fresh_context:
+                    break
+        merged_contexts.update(web_fresh)
+        fresh_symbols.update(web_fresh)
+        web_statuses = tuple(str(item["status"]) for item in web_attempts)
+        diagnostics["CANDIDATE_WEB_RSS"] = {
+            "status": (
+                "AVAILABLE"
+                if web_fresh
+                else (web_statuses[-1] if web_statuses else "PROVIDER_UNAVAILABLE")
+            ),
+            "candidates_checked": tuple(item["symbol"] for item in web_attempts),
+            "fresh_contexts": tuple(sorted(web_fresh)),
+            "attempts": tuple(web_attempts),
+            "articles_returned": sum(int(item["articles_returned"]) for item in web_attempts),
+            "broker_write_calls": 0,
+        }
+    return cycle.model_copy(
+        update={
+            "news_asset_contexts": merged_contexts,
+            "news_provider_diagnostics": diagnostics,
+        }
+    )
+
+
 def _global_demo_selection_blockers(
     *,
     cycle: ActiveIntelligenceCycleRecord,
@@ -2600,20 +3606,55 @@ def _global_demo_selection_blockers(
     blockers: list[str] = []
     if cycle.news_events_fresh <= 0:
         blockers.append("FRESH_NEWS_REQUIRED")
-    # Use the full evaluated candidate set for coverage diagnostics.  The
-    # executable candidate may still need to be in an open session, but the
-    # comparison itself must see the regions represented by the cached causal
-    # universe rather than only the currently open exchange.
-    candidates = tuple(scanner_result.candidates)
+    # Coverage is a gate on executable TOP selections, not on every row the
+    # scanner evaluated. HOLD/WATCHLIST rows are useful diagnostics, but they
+    # are not a buy decision and must not block a crypto-led TOP selection
+    # merely because the currently available equity data comes from one
+    # exchange region. A non-crypto TOP BUY still requires multi-region
+    # coverage before it can reach the Demo package path.
+    candidates = tuple(
+        candidate
+        for candidate in scanner_result.top_opportunities
+        if candidate.decision is AegisDecision.BUY
+    )
     by_symbol = {instrument.symbol: instrument for instrument in instruments}
     regions = {
         _selection_region(candidate.symbol, candidate.asset_class.value, by_symbol.get(candidate.symbol))
         for candidate in candidates
     }
     non_crypto_regions = {region for region in regions if region != "CRYPTO"}
-    if non_crypto_regions and len(non_crypto_regions) < 2:
-        blockers.append("MULTI_REGION_COVERAGE_REQUIRED")
+    # Region diversity is useful evidence for ranking diagnostics, but it must
+    # not deadlock an otherwise valid BUY package. The acquisition coverage
+    # ratio, asset-linked news, RiskManager, preflight and execution gate are
+    # the actual admission controls. A single currently open region is normal
+    # outside overlapping market hours and is not proof that the candidate is
+    # unsafe.
     return tuple(blockers)
+
+
+def _scanner_asset_class_counts(scanner_result: ActiveScannerResult) -> dict[str, dict[str, int]]:
+    """Expose class composition so multi-asset exclusion is observable."""
+
+    def counts(candidates: Collection[ActiveScannerCandidate]) -> dict[str, int]:
+        result: Counter[str] = Counter()
+        for candidate in candidates:
+            result[candidate.asset_class.value] += 1
+        return dict(sorted(result.items()))
+
+    return {
+        "evaluated": counts(scanner_result.candidates),
+        "buy_signals": counts(
+            tuple(
+                candidate
+                for candidate in scanner_result.candidates
+                if candidate.bucket is ActiveScannerBucket.TOP_OPPORTUNITIES
+            )
+        ),
+        "top": counts(scanner_result.top_opportunities),
+        "watchlist": counts(scanner_result.watchlist),
+        "no_trade": counts(scanner_result.no_trade),
+        "rejected": counts(scanner_result.rejected),
+    }
 
 
 def _selection_region(
@@ -2641,15 +3682,192 @@ def _selection_region(
     return "OTHER"
 
 
+def _execution_quote_check_time(
+    quote_as_of: datetime,
+    *,
+    maximum_future_skew_seconds: int = 5,
+) -> datetime:
+    """Wait for bounded broker clock skew without rewriting market evidence."""
+    checked_at = datetime.now(UTC)
+    ahead_seconds = (quote_as_of - checked_at).total_seconds()
+    if 0 < ahead_seconds <= maximum_future_skew_seconds:
+        # Refetching immediately yields another rate ahead of the local clock.
+        # Keep this quote, wait once, then let the strict freshness check decide.
+        sleep(ahead_seconds)
+        checked_at = datetime.now(UTC)
+    return checked_at
+
+
+def _fair_execution_candidate_order(
+    candidates: tuple[ActiveScannerCandidate, ...],
+) -> tuple[ActiveScannerCandidate, ...]:
+    """Interleave broker checks across asset classes without changing ranking.
+
+    The live eToro reads behind package construction are bounded and rate
+    limited.  Processing a score-sorted list straight through can spend that
+    scarce budget on one class (historically crypto), leaving equally ranked
+    equities and ETFs unverified.  Preserve the existing order within each
+    class, but take one candidate per class per pass.
+    """
+    if len(candidates) < 2:
+        return candidates
+    by_class: dict[AssetClass, list[ActiveScannerCandidate]] = {}
+    for candidate in candidates:
+        by_class.setdefault(candidate.asset_class, []).append(candidate)
+    class_order = [
+        asset_class
+        for asset_class in (AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO)
+        if asset_class in by_class
+    ]
+    class_order.extend(
+        sorted(
+            (asset_class for asset_class in by_class if asset_class not in class_order),
+            key=lambda asset_class: asset_class.value,
+        )
+    )
+    ordered: list[ActiveScannerCandidate] = []
+    index = 0
+    while class_order:
+        next_order: list[AssetClass] = []
+        for asset_class in class_order:
+            bucket = by_class[asset_class]
+            if index < len(bucket):
+                ordered.append(bucket[index])
+            if index + 1 < len(bucket):
+                next_order.append(asset_class)
+        class_order = next_order
+        index += 1
+    return tuple(ordered)
+
+
+def _candidate_execution_diagnostics(
+    *,
+    cycle: ActiveIntelligenceCycleRecord,
+    scanner_result: ActiveScannerResult,
+    package_diagnostics: object,
+    quote_diagnostics: object,
+    pilot_result: object,
+) -> tuple[dict[str, object], ...]:
+    """Join market, news, packaging, and gate outcomes by candidate symbol."""
+    packages = package_diagnostics if isinstance(package_diagnostics, Mapping) else {}
+    quotes = quote_diagnostics if isinstance(quote_diagnostics, Mapping) else {}
+    pilot = (
+        pilot_result.model_dump(mode="json")
+        if hasattr(pilot_result, "model_dump")
+        else pilot_result
+    )
+    submissions = pilot.get("submissions", ()) if isinstance(pilot, Mapping) else ()
+    submitted_by_symbol = {
+        str(item.get("symbol")): item
+        for item in submissions
+        if isinstance(item, Mapping) and item.get("symbol")
+    } if isinstance(submissions, (list, tuple)) else {}
+    contexts = cycle.news_asset_contexts
+    ranked_watchlist = _fair_execution_candidate_order(
+        tuple(
+            sorted(
+                scanner_result.watchlist,
+                key=lambda item: (item.opportunity_score, item.confidence),
+                reverse=True,
+            )
+        )
+    )[:8]
+    candidates = tuple(scanner_result.top_opportunities) + ranked_watchlist
+    unique_by_symbol: dict[str, ActiveScannerCandidate] = {}
+    for candidate in candidates:
+        unique_by_symbol.setdefault(candidate.symbol, candidate)
+    unique_candidates = tuple(unique_by_symbol.values())
+    rows: list[dict[str, object]] = []
+    for candidate in _fair_execution_candidate_order(unique_candidates):
+        raw_context = contexts.get(candidate.symbol, {})
+        context = (
+            raw_context.model_dump(mode="json")
+            if hasattr(raw_context, "model_dump")
+            else raw_context
+        )
+        context = context if isinstance(context, Mapping) else {}
+        raw_quote = quotes.get(candidate.symbol, {})
+        quote = raw_quote if isinstance(raw_quote, Mapping) else {}
+        row: dict[str, object] = {
+            "symbol": candidate.symbol,
+            "asset_class": candidate.asset_class.value,
+            "bucket": candidate.bucket.value,
+            "package_status": packages.get(candidate.symbol, "NOT_PREPARED"),
+            "quote": dict(quote),
+            "news": {
+                "freshness": context.get("freshness", "NEWS_CONTEXT_MISSING"),
+                "material_event_count": context.get("material_event_count", 0),
+                "event_risk": context.get("event_risk"),
+                "latest_material_event_timestamp": context.get(
+                    "latest_material_event_timestamp"
+                ),
+            },
+        }
+        submission = submitted_by_symbol.get(candidate.symbol)
+        if submission is not None:
+            row["submission"] = {
+                "status": submission.get("sanitized_status"),
+                "submitted": bool(submission.get("submitted", False)),
+                "risk_violation_codes": tuple(
+                    str(code) for code in submission.get("risk_violation_codes", ())
+                ),
+                "preflight_reasons": tuple(
+                    str(reason) for reason in submission.get("preflight_reasons", ())
+                ),
+            }
+        rows.append(row)
+    return tuple(rows)
+
+
+MAX_NEW_CRYPTO_PORTFOLIO_EXPOSURE_FRACTION = Decimal("0.50")
+
+
+def _verified_crypto_exposure_headroom(
+    snapshot: DemoPortfolioSnapshot,
+    catalog_items: tuple[dict[str, object], ...],
+) -> Decimal | None:
+    """Fail closed unless every live position has a catalog-verified class."""
+    if snapshot.total_value <= 0:
+        return None
+    classes: dict[int, str] = {}
+    for item in catalog_items:
+        instrument_id = item.get("instrumentID", item.get("instrumentId"))
+        instrument_type = item.get("instrumentTypeID", item.get("instrumentTypeId"))
+        if not isinstance(instrument_id, int) or not isinstance(instrument_type, int):
+            continue
+        asset_class = {5: "EQUITY", 6: "ETF", 10: "CRYPTO"}.get(instrument_type)
+        if asset_class is None:
+            continue
+        previous = classes.get(instrument_id)
+        if previous is not None and previous != asset_class:
+            return None
+        classes[instrument_id] = asset_class
+    crypto_exposure = Decimal("0")
+    for position in snapshot.positions:
+        asset_class = classes.get(position.instrument_id)
+        if asset_class is None:
+            return None
+        if asset_class == "CRYPTO":
+            crypto_exposure += position.current_exposure
+    cap = snapshot.total_value * MAX_NEW_CRYPTO_PORTFOLIO_EXPOSURE_FRACTION
+    return max(Decimal("0"), cap - crypto_exposure).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+
+
 def _build_live_submission_packages(
     *,
     cycle: ActiveIntelligenceCycleRecord,
     scanner_result: ActiveScannerResult,
     client: EtoroReadClient,
+    instrument_ids_by_symbol: Mapping[str, int],
     config: ApplicationConfig,
     settings: EtoroDemoPilotSettings,
     registry: SqliteRecordStore,
     diagnostics: dict[str, object] | None = None,
+    sizing_diagnostics: dict[str, object] | None = None,
+    quote_diagnostics: dict[str, dict[str, object]] | None = None,
+    maximum_future_quote_skew_seconds: int = 5,
 ) -> Mapping[str, EtoroDemoSubmissionPackage]:
     """Build execution material only after an accepted decision cycle."""
     def record(symbol: str, reason: str) -> None:
@@ -2660,62 +3878,72 @@ def _build_live_submission_packages(
         if diagnostics is not None:
             diagnostics["_runtime"] = "AUTHORIZED_CAPITAL_MISSING"
         return {}
-    managed_exposure = registry.managed_demo_exposure_eur()
-    if managed_exposure is None:
-        if diagnostics is not None:
-            diagnostics["_runtime"] = "MANAGED_EXPOSURE_UNAVAILABLE"
-        return {}
     try:
         identity = client.identity()
         demo_snapshot = client.demo_account(identity)
-    except EtoroApiError as exc:
+    except (EtoroApiError, EtoroMappingError, ValueError, TypeError) as exc:
         # Account-read failures must not erase an already completed global
         # intelligence cycle or stop the continuous scanner.  Packaging is
         # an execution-time concern: keep the cycle observable, return no
         # executable package, and let the pilot fail closed for this poll.
         record(
             "_runtime",
-            f"DEMO_ACCOUNT_READ_FAILED:{exc.status or exc.category.value}",
+            f"DEMO_ACCOUNT_READ_FAILED:{getattr(exc, 'status', None) or type(exc).__name__}",
         )
         return {}
-    # The eToro Demo account is denominated in USD in the live session, while
-    # Aegis' authorization envelope is expressed in EUR.  Do not ask the
-    # generic preflight to invent an FX conversion: size the Demo order in the
-    # account currency. The configured 200-unit envelope is the total hard
-    # upper bound, while each individual entry is capped separately so the
-    # strategy can add a second tranche only after the first is confirmed.
-    if demo_snapshot.currency not in {Currency.EUR, Currency.USD}:
+    if config.authorized_capital is None:
+        if diagnostics is not None:
+            diagnostics["_runtime"] = "AUTHORIZED_CAPITAL_MISSING"
+        return {}
+    # The authorization, managed ledger, broker cash and proposed order must
+    # all use the same currency. Never compare nominal EUR and USD amounts.
+    if demo_snapshot.currency is not config.authorized_capital_currency:
         if diagnostics is not None:
             diagnostics["_runtime"] = (
-                "DEMO_ACCOUNT_CURRENCY_UNSUPPORTED:" + demo_snapshot.currency.value
+                "AUTHORIZED_CAPITAL_CURRENCY_MISMATCH:"
+                f"configured={config.authorized_capital_currency.value};"
+                f"account={demo_snapshot.currency.value}"
             )
         return {}
-    demo_order_amount = min(
-        config.authorized_capital_eur,
-        DEMO_MAX_SINGLE_ORDER_AMOUNT,
-        demo_snapshot.cash,
+    managed_exposure_limit = effective_aegis_managed_exposure_limit(
+        config.authorized_capital, demo_snapshot.currency
     )
-    if demo_order_amount <= 0:
+    if managed_exposure_limit is None:
         if diagnostics is not None:
-            diagnostics["_runtime"] = "DEMO_BUYING_POWER_UNAVAILABLE"
+            diagnostics["_runtime"] = "AUTHORIZED_CAPITAL_CURRENCY_UNSUPPORTED"
         return {}
+    managed_exposure = registry.managed_demo_exposure(demo_snapshot.currency)
+    if managed_exposure is None:
+        if diagnostics is not None:
+            diagnostics["_runtime"] = "MANAGED_EXPOSURE_UNAVAILABLE_OR_UNDENOMINATED"
+        return {}
+    remaining_managed_exposure = max(
+        Decimal("0"), managed_exposure_limit - managed_exposure
+    )
+    if remaining_managed_exposure <= 0:
+        if diagnostics is not None:
+            diagnostics["_runtime"] = "AEGIS_MANAGED_EXPOSURE_CAP_REACHED"
+        return {}
+    max_single_order = MAX_AEGIS_MANAGED_EXPOSURE_BY_CURRENCY[demo_snapshot.currency]
+    policy_engine = default_asset_policy_engine(
+        minimum_cash_reserve=config.risk.min_cash_reserve
+    )
     packages: dict[str, EtoroDemoSubmissionPackage] = {}
     # Prepare the TOP candidate first, but also prepare a bounded fallback
     # lane.  A transient resolution/quote/eligibility failure for the first
     # candidate must not turn a valid cycle into the historic zero-order dead
     # end.  The pilot still selects only package-ready candidates and keeps
     # every preflight, RiskManager and execution gate intact.
-    ranked_watchlist = tuple(
-        sorted(
+    ranked_watchlist = _fair_execution_candidate_order(
+        tuple(sorted(
             scanner_result.watchlist,
             key=lambda candidate: (
-                candidate.asset_class.value == "CRYPTO",
                 candidate.opportunity_score,
                 candidate.confidence,
             ),
             reverse=True,
-        )[:8]
-    )
+        ))
+    )[:8]
     candidates_for_demo = tuple(
         dict.fromkeys(
             candidate.symbol
@@ -2726,16 +3954,57 @@ def _build_live_submission_packages(
         candidate.symbol: candidate
         for candidate in tuple(scanner_result.top_opportunities) + ranked_watchlist
     }
-    candidates_for_demo = tuple(candidate_by_symbol[symbol] for symbol in candidates_for_demo)
+    candidates_for_demo = _fair_execution_candidate_order(
+        tuple(candidate_by_symbol[symbol] for symbol in candidates_for_demo)
+    )
+    crypto_exposure_headroom: Decimal | None = None
+    if any(candidate.asset_class is AssetClass.CRYPTO for candidate in candidates_for_demo):
+        try:
+            from app.data.runtime import (
+                DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+                _validated_etoro_catalog_items,
+            )
+
+            crypto_exposure_headroom = _verified_crypto_exposure_headroom(
+                demo_snapshot,
+                _validated_etoro_catalog_items(DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH),
+            )
+        except (OSError, ValueError, TypeError):
+            # Unknown broker position classes cannot prove a crypto buy stays
+            # below the portfolio-level cap. Equity/ETF candidates remain
+            # independently eligible for their normal hard gates.
+            crypto_exposure_headroom = None
     for candidate in candidates_for_demo:
+        asset_policy = policy_engine.policy_for(candidate.asset_class)
+        if candidate.asset_class is AssetClass.CRYPTO and crypto_exposure_headroom is None:
+            record(candidate.symbol, "CRYPTO_CLASS_EXPOSURE_UNVERIFIED")
+            continue
+        instrument_id = instrument_ids_by_symbol.get(candidate.symbol)
+        if instrument_id is None or instrument_id <= 0:
+            record(candidate.symbol, "VERIFIED_CATALOG_INSTRUMENT_ID_MISSING")
+            continue
         # A provider rate limit is local to this candidate.  It must not
         # abort the already completed intelligence cycle or kill the runner.
         try:
             resolution = _read_etoro_with_rate_limit_retry(
-                lambda: client.resolve_instrument(candidate.symbol, as_of=cycle.scheduled_at)
+                partial(
+                    client.resolve_instrument_id,
+                    instrument_id,
+                    symbol=candidate.symbol,
+                    as_of=cycle.scheduled_at,
+                )
             )
-        except EtoroApiError as exc:
-            record(candidate.symbol, f"RESOLUTION_READ_FAILED:{exc.status or 'UNKNOWN'}")
+        except (EtoroApiError, EtoroMappingError, ValueError, TypeError) as exc:
+            record(
+                candidate.symbol,
+                f"RESOLUTION_READ_FAILED:{getattr(exc, 'status', None) or type(exc).__name__}",
+            )
+            continue
+        if (
+            resolution.instrument_id != instrument_id
+            or resolution.internal_symbol_full.casefold() != candidate.symbol.casefold()
+        ):
+            record(candidate.symbol, "RESOLUTION_ID_SYMBOL_MISMATCH")
             continue
         if not resolution.verified or not resolution.structurally_supported:
             record(candidate.symbol, "RESOLUTION_NOT_VERIFIED_OR_UNSUPPORTED")
@@ -2748,34 +4017,220 @@ def _build_live_submission_packages(
         if resolved_class is not candidate.asset_class:
             record(candidate.symbol, "ASSET_CLASS_MISMATCH")
             continue
-        instrument_id = resolution.instrument_id
-        try:
-            quote = _read_etoro_with_rate_limit_retry(
-                lambda: client.quote(
-                    instrument_id, candidate.symbol, currency=demo_snapshot.currency
+        if (
+            candidate.asset_class in {AssetClass.EQUITY, AssetClass.ETF}
+            and _preflight_market_status(resolution) is MarketStatus.CLOSED
+        ):
+            record(candidate.symbol, "MARKET_CLOSED")
+            if quote_diagnostics is not None:
+                quote_diagnostics[candidate.symbol] = {
+                    "status": "MARKET_CLOSED",
+                    "checked_at": datetime.now(UTC).isoformat(),
+                    "attempts": 0,
+                    "max_age_seconds": config.risk.max_price_age_seconds,
+                }
+            continue
+        quote = None
+        quote_fresh = False
+        quote_read_error: Exception | None = None
+        for quote_attempt in range(2):
+            try:
+                quote = _read_etoro_with_rate_limit_retry(
+                    partial(
+                        client.quote,
+                        instrument_id,
+                        candidate.symbol,
+                        currency=demo_snapshot.currency,
+                    )
                 )
+                quote_read_error = None
+            except (EtoroApiError, EtoroMappingError, ValueError, TypeError) as exc:
+                quote_read_error = exc
+                if quote_diagnostics is not None:
+                    prior = quote_diagnostics.get(candidate.symbol, {})
+                    quote_diagnostics[candidate.symbol] = {
+                        **prior,
+                        "status": "QUOTE_READ_FAILED",
+                        "attempts": quote_attempt + 1,
+                        "error_code": (
+                            str(getattr(exc, "status", None) or type(exc).__name__)
+                        ),
+                        "checked_at": datetime.now(UTC).isoformat(),
+                        "max_age_seconds": config.risk.max_price_age_seconds,
+                    }
+                if quote_attempt == 1:
+                    break
+                continue
+            # The broker's rate timestamp is market evidence, not the time at
+            # which Aegis is making an execution decision. Never make an old
+            # quote look fresh by evaluating the risk and preflight at that old
+            # timestamp (or mint an authorization that is already expired).
+            quote_received_at = _execution_quote_check_time(
+                quote.as_of,
+                maximum_future_skew_seconds=maximum_future_quote_skew_seconds,
             )
+            quote_age = quote_received_at - quote.as_of
+            quote_fresh = timedelta(0) <= quote_age <= timedelta(
+                seconds=config.risk.max_price_age_seconds
+            )
+            if quote_diagnostics is not None:
+                quote_diagnostics[candidate.symbol] = {
+                    "status": (
+                        "FRESH"
+                        if quote_fresh
+                        else "FUTURE_TIMESTAMP"
+                        if quote_age < timedelta(0)
+                        else "STALE"
+                    ),
+                    "attempts": quote_attempt + 1,
+                    "quote_as_of": quote.as_of.isoformat(),
+                    "checked_at": quote_received_at.isoformat(),
+                    "age_seconds": round(quote_age.total_seconds(), 3),
+                    "max_age_seconds": config.risk.max_price_age_seconds,
+                }
+            if quote_fresh:
+                break
+        if not quote_fresh or quote is None:
+            if quote_read_error is not None:
+                record(
+                    candidate.symbol,
+                    "QUOTE_READ_FAILED:"
+                    f"{getattr(quote_read_error, 'status', None) or type(quote_read_error).__name__}",
+                )
+            else:
+                record(candidate.symbol, "QUOTE_NOT_FRESH_FOR_EXECUTION")
+            continue
+        try:
             eligibility = _read_etoro_with_rate_limit_retry(
-                lambda: client.demo_eligibility(
+                partial(
+                    client.demo_eligibility,
                     instrument_id,
                     candidate.symbol,
                     currency=demo_snapshot.currency,
                 )
             )
-        except EtoroApiError as exc:
-            record(candidate.symbol, f"QUOTE_OR_ELIGIBILITY_READ_FAILED:{exc.status or 'UNKNOWN'}")
+        except EtoroEligibilityDenied:
+            record(candidate.symbol, "BROKER_EXPLICITLY_DISALLOWS_OPENING")
+            continue
+        except (EtoroApiError, EtoroMappingError, ValueError, TypeError) as exc:
+            record(
+                candidate.symbol,
+                "ELIGIBILITY_READ_FAILED:"
+                f"{getattr(exc, 'status', None) or type(exc).__name__}",
+            )
             continue
         # The rates endpoint intentionally maps market_status to UNKNOWN;
         # resolution is the authoritative live-session/tradability source.
         # Reuse the same Crypto 24/7-aware mapping as the controlled preflight
         # instead of failing every valid Crypto candidate at the next gate.
         quote = quote.model_copy(update={"market_status": _preflight_market_status(resolution)})
-        instrument = _instrument_from_eligibility(resolution, eligibility, quote.as_of)
+        execution_check_at = datetime.now(UTC)
+        instrument = _instrument_from_eligibility(resolution, eligibility, execution_check_at)
         risk_portfolio = _portfolio_from_demo_snapshot(
             demo_snapshot,
             target_instrument_id=instrument_id,
             target_symbol=candidate.symbol,
         )
+        # Size against the exact PortfolioSnapshot the RiskManager will see,
+        # not the broker DTO used earlier in the read path. Leave a small
+        # account-currency cushion below the reserve boundary so cent/Decimal
+        # reconstruction cannot turn a nominally compliant size into
+        # MIN_CASH_RESERVE_BREACHED at the final risk gate.
+        risk_reference_value = min(
+            risk_portfolio.total_value, config.authorized_capital
+        )
+        # RiskManager divides post-trade cash by the whole portfolio value.
+        # The managed exposure ceiling must not reduce this reserve basis.
+        cash_reserve_reference = risk_portfolio.total_value
+        required_cash_reserve = max(
+            config.risk.min_cash_reserve, asset_policy.minimum_cash_reserve
+        )
+        risk_trade_cap = risk_reference_value * min(
+            config.risk.max_trade_size, asset_policy.max_new_trade_exposure
+        )
+        cash_reserve_cap = _cash_reserve_aware_order_cap(
+            cash=risk_portfolio.cash,
+            reference_value=cash_reserve_reference,
+            reserve_fraction=required_cash_reserve,
+            rounding_buffer=Decimal("1.00"),
+        )
+        sizing_caps = {
+            "managed_exposure_limit": managed_exposure_limit,
+            "remaining_managed_exposure": remaining_managed_exposure,
+            "single_order_limit": max_single_order,
+            "account_cash": risk_portfolio.cash,
+            "risk_trade_cap": risk_trade_cap,
+            "cash_reserve_cap": cash_reserve_cap,
+        }
+        if candidate.asset_class is AssetClass.CRYPTO:
+            sizing_caps["crypto_portfolio_exposure_cap"] = crypto_exposure_headroom
+        demo_order_amount = min(sizing_caps.values()).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+        if demo_order_amount <= 0:
+            zero_caps = tuple(
+                name for name, amount in sizing_caps.items() if amount <= 0
+            )
+            record(
+                candidate.symbol,
+                "CRYPTO_PORTFOLIO_EXPOSURE_LIMIT_REACHED"
+                if zero_caps == ("crypto_portfolio_exposure_cap",)
+                else "DEMO_BUYING_POWER_UNAVAILABLE",
+            )
+            if sizing_diagnostics is not None:
+                zero_caps = tuple(
+                    name for name, amount in sizing_caps.items() if amount <= 0
+                )
+                sizing_diagnostics[candidate.symbol] = {
+                    "status": "NO_POSITIVE_SAFE_ORDER_AMOUNT",
+                    "zero_caps": zero_caps,
+                    "rounded_below_account_cent": not zero_caps,
+                    "cash_reserve_fraction": str(required_cash_reserve),
+                    "cash_reserve_required": str(
+                        (cash_reserve_reference * required_cash_reserve).quantize(
+                            Decimal("0.01"), rounding=ROUND_DOWN
+                        )
+                    ),
+                    "cash_reserve_shortfall": str(
+                        max(
+                            Decimal("0"),
+                            (cash_reserve_reference * required_cash_reserve)
+                            + Decimal("1.00")
+                            - risk_portfolio.cash,
+                        ).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    ),
+                    "account_currency": demo_snapshot.currency.value,
+                }
+            continue
+        # A positive cash headroom is not an executable order when it is
+        # smaller than the broker-verified minimum. Keep this out of the
+        # package-ready lane rather than handing an impossible proposal to
+        # preflight nine times in the same cycle. Never lower the reserve or
+        # broker minimum to manufacture buying power.
+        if eligibility.minimum_position is None or eligibility.minimum_position <= 0:
+            record(candidate.symbol, "VERIFIED_MINIMUM_POSITION_UNAVAILABLE")
+            if sizing_diagnostics is not None:
+                sizing_diagnostics[candidate.symbol] = {
+                    "status": "VERIFIED_MINIMUM_POSITION_UNAVAILABLE",
+                    "safe_order_amount": str(demo_order_amount),
+                    "account_currency": demo_snapshot.currency.value,
+                }
+            continue
+        if demo_order_amount < eligibility.minimum_position:
+            record(candidate.symbol, "SAFE_ORDER_BELOW_VERIFIED_MINIMUM")
+            if sizing_diagnostics is not None:
+                sizing_diagnostics[candidate.symbol] = {
+                    "status": "SAFE_ORDER_BELOW_VERIFIED_MINIMUM",
+                    "safe_order_amount": str(demo_order_amount),
+                    "verified_minimum_position": str(eligibility.minimum_position),
+                    "limiting_caps": tuple(
+                        name for name, amount in sizing_caps.items()
+                        if amount == min(sizing_caps.values())
+                    ),
+                    "cash_reserve_fraction": str(required_cash_reserve),
+                    "account_currency": demo_snapshot.currency.value,
+                }
+            continue
         idempotency_key = f"etoro-demo-pilot:{cycle.cycle_id}:{candidate.symbol}:OPEN"
         proposal = TradeProposal(
             proposal_id=uuid5(NAMESPACE_URL, idempotency_key),
@@ -2817,28 +4272,22 @@ def _build_live_submission_packages(
             invalidation_conditions=("accepted A4C thesis no longer holds",),
             expected_holding_period=HoldingPeriod.DAYS,
         )
-        global_news_available = (
-            cycle.news_events_fresh > 0
-            and cycle.news_provider_status in {"AVAILABLE", "PARTIAL"}
-        )
         risk_context = RiskContext(
-            evaluated_at=quote.as_of,
+            evaluated_at=execution_check_at,
             portfolio=risk_portfolio,
             price=quote.to_price_snapshot(),
             instrument=instrument,
             market_data_available=True,
-            # The cycle already passed the global news acquisition.  Prefer
-            # asset-linked evidence when available, but do not turn a missing
-            # ticker-specific mapping into a permanent zero-order dead end.
-            news_data_available=(
-                _candidate_news_available(cycle, candidate.symbol)
-                or global_news_available
-            ),
+            # News is mandatory for the specific instrument. Global or
+            # unlinked geopolitical headlines are context only and must not
+            # authorize an order for an unrelated equity, ETF, or crypto.
+            news_data_available=_candidate_news_available(cycle, candidate.symbol),
             daily_new_trade_count=0,
             recent_idempotency_keys=frozenset(),
             api_state_consistent=True,
             capital_envelope=AuthorizedCapitalEnvelope(
-                authorized_capital_eur=config.authorized_capital_eur,
+                currency=demo_snapshot.currency,
+                authorized_capital_eur=managed_exposure_limit,
                 managed_exposure_eur=managed_exposure,
                 # These are alternative packages, not reservations. Capital
                 # is reserved only by the broker submission record after a
@@ -2858,9 +4307,9 @@ def _build_live_submission_packages(
             kill_switch=KillSwitch(
                 active=False,
                 reason="preflight",
-                clock=_fixed_clock(quote.as_of),
+                clock=_fixed_clock(execution_check_at),
             ),
-            now=quote.as_of,
+            now=execution_check_at,
             maximum_age_seconds=config.risk.max_price_age_seconds,
         )
         packages[candidate.symbol] = EtoroDemoSubmissionPackage(
@@ -2873,6 +4322,22 @@ def _build_live_submission_packages(
     return packages
 
 
+def _cash_reserve_aware_order_cap(
+    *,
+    cash: Decimal,
+    reference_value: Decimal,
+    reserve_fraction: Decimal,
+    rounding_buffer: Decimal = Decimal("1.00"),
+) -> Decimal:
+    """Cap a buy below (not on) the RiskManager's minimum-cash boundary."""
+    if cash < 0 or reference_value <= 0 or not Decimal("0") <= reserve_fraction < Decimal("1"):
+        return Decimal("0.00")
+    headroom = cash - (reference_value * reserve_fraction) - max(
+        Decimal("0"), rounding_buffer
+    )
+    return max(Decimal("0"), headroom).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
 def _read_etoro_with_rate_limit_retry[T](operation: Callable[[], T]) -> T:
     """Retry one read after a broker 429 without weakening execution gates."""
     for attempt in range(2):
@@ -2883,6 +4348,177 @@ def _read_etoro_with_rate_limit_retry[T](operation: Callable[[], T]) -> T:
                 raise
             sleep(2.0)
     raise RuntimeError("unreachable rate-limit retry state")
+
+
+DEMO_ORDER_LOOKUP_RETRY_BACKOFF = timedelta(minutes=5)
+
+
+def _demo_order_lookup_due(
+    payload: Mapping[str, object], *, now: datetime
+) -> bool:
+    raw_checked_at = payload.get("broker_order_lookup_attempted_at")
+    if not isinstance(raw_checked_at, str):
+        return True
+    try:
+        checked_at = datetime.fromisoformat(raw_checked_at)
+    except ValueError:
+        return True
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=UTC)
+    return now - checked_at >= DEMO_ORDER_LOOKUP_RETRY_BACKOFF
+
+
+def _legacy_fill_needs_order_lookup(payload: Mapping[str, object]) -> bool:
+    return not (
+        str(payload.get("broker_order_status", "")).upper() == "FILLED"
+        and payload.get("broker_position_id")
+        and payload.get("broker_reconciliation_source")
+        and payload.get("executed_exposure_account_currency") is not None
+    )
+
+
+def _reconcile_unresolved_demo_submissions(
+    *,
+    registry: SqliteRecordStore,
+    client: EtoroReadClient,
+    identity: BrokerIdentity,
+    observed_at: datetime,
+) -> dict[str, object]:
+    """Refresh broker states before sizing new Demo exposure.
+
+    A write can be accepted before eToro exposes the order in its breakdown
+    endpoint.  Re-reading later is safe; treating that temporary absence as a
+    new order opportunity is not.  Only an explicit broker state changes the
+    local lifecycle record, while unreadable orders remain unresolved.
+    """
+    records = list(registry.unresolved_demo_submissions())
+    seen_keys = {str(record.get("idempotency_key", "")) for record in records}
+    legacy_records = [
+        record
+        for record in registry.filled_demo_submissions()
+        if str(record.get("idempotency_key", "")) not in seen_keys
+        and isinstance(record.get("payload"), Mapping)
+        and _legacy_fill_needs_order_lookup(record["payload"])
+    ]
+    records.extend(legacy_records)
+    verified = 0
+    legacy_verified = 0
+    attempted = 0
+    legacy_attempted = 0
+    errors: list[str] = []
+    lookup_checked_at = datetime.now(UTC)
+    for record in records:
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            errors.append("INVALID_PAYLOAD")
+            continue
+        key = str(record.get("idempotency_key", ""))
+        try:
+            instrument_id = int(payload["instrument_id"])
+            order_id = str(payload["broker_order_id"])
+        except (KeyError, TypeError, ValueError):
+            errors.append("MISSING_ORDER_REFERENCE")
+            continue
+        if instrument_id <= 0 or not order_id:
+            errors.append("INVALID_ORDER_REFERENCE")
+            continue
+        if not _demo_order_lookup_due(payload, now=lookup_checked_at):
+            continue
+        attempted += 1
+        is_legacy_fill = str(record.get("state", "")).upper() in {
+            "FILLED",
+            "PARTIALLY_FILLED",
+        }
+        if is_legacy_fill:
+            legacy_attempted += 1
+        lookup_details: Mapping[str, object] = {}
+        official_lookup_succeeded = False
+        try:
+            detail_lookup = getattr(client, "demo_order_lookup_details", None)
+            lookup = getattr(client, "demo_order_lookup", None)
+            if callable(detail_lookup):
+                raw_details = detail_lookup(order_id)
+                lookup_details = (
+                    raw_details if isinstance(raw_details, Mapping) else {}
+                )
+                observed = lookup_details.get("state", ExecutionState.UNKNOWN)
+                official_lookup_succeeded = True
+            elif callable(lookup):
+                observed = lookup(order_id)
+                official_lookup_succeeded = True
+            else:
+                observed = client.demo_order_state(identity, instrument_id, order_id)
+        except (EtoroApiError, EtoroMappingError, RuntimeError, TypeError, ValueError):
+            observed = ExecutionState.UNKNOWN
+        if not isinstance(observed, ExecutionState):
+            try:
+                observed = ExecutionState(str(getattr(observed, "value", observed)).upper())
+            except ValueError:
+                observed = ExecutionState.UNKNOWN
+        position_id = lookup_details.get("position_id")
+        executed_exposure = lookup_details.get(
+            "executed_exposure_account_currency"
+        )
+        updates: dict[str, object] = {
+            "broker_order_lookup_attempted_at": lookup_checked_at.isoformat(),
+            "broker_order_lookup_status": observed.value,
+        }
+        if official_lookup_succeeded and observed is not ExecutionState.UNKNOWN:
+            updates.update(
+                {
+                    "broker_order_status": observed.value,
+                    "broker_reconciliation_source": "ETORO_V2_ORDER_LOOKUP",
+                    "broker_order_reconciled_at": lookup_checked_at.isoformat(),
+                }
+            )
+            if (
+                observed is ExecutionState.FILLED
+                and isinstance(position_id, str)
+                and position_id.isdigit()
+            ):
+                updates["broker_position_id"] = position_id
+                if isinstance(executed_exposure, str):
+                    updates["executed_exposure_account_currency"] = executed_exposure
+        registry.update_demo_submission(
+            key,
+            observed.value if observed is not ExecutionState.UNKNOWN else str(record.get("state", "UNKNOWN")),
+            updates,
+        )
+        if official_lookup_succeeded and observed is not ExecutionState.UNKNOWN:
+            verified += 1
+            if is_legacy_fill:
+                legacy_verified += 1
+        elif observed is ExecutionState.UNKNOWN:
+            errors.append("ORDER_LOOKUP_STATUS_UNKNOWN")
+        if (
+            official_lookup_succeeded
+            and observed is ExecutionState.FILLED
+            and isinstance(position_id, str)
+            and position_id.isdigit()
+            and isinstance(executed_exposure, str)
+        ):
+            registry.update_demo_submission(
+                key,
+                observed.value,
+                {
+                    "reconciliation": "verified",
+                    "reconciled_at": lookup_checked_at.isoformat(),
+                },
+            )
+    return {
+        "attempted": attempted,
+        "verified": verified,
+        "legacy_attempted": legacy_attempted,
+        "legacy_verified": legacy_verified,
+        "legacy_remaining": sum(
+            1
+            for record in registry.filled_demo_submissions()
+            if isinstance(record.get("payload"), Mapping)
+            and _legacy_fill_needs_order_lookup(record["payload"])
+        ),
+        "remaining": len(registry.unresolved_demo_submissions()),
+        "errors": tuple(sorted(set(errors))),
+    }
 
 
 def build_active_intelligence_orchestrator_report(
@@ -2947,7 +4583,7 @@ def build_active_intelligence_orchestrator_report(
     if unavailable is None:
         raise RuntimeError("offline unavailable fixture did not produce a cycle")
     if not records:
-        persisted_cycles = audit_store.cycles()
+        last_cycle = audit_store.latest_cycle()
         return {
             "status": "NO_CYCLE",
             "phase": "STEP_9_0E_ACTIVE_INTELLIGENCE_ORCHESTRATOR",
@@ -2955,7 +4591,7 @@ def build_active_intelligence_orchestrator_report(
             "broker_write_calls": 0,
             "demo_execution_enabled": config.etoro_demo_execution_enabled,
             "real_execution_available": False,
-            "last_successful_cycle": (persisted_cycles[-1] if persisted_cycles else None),
+            "last_successful_cycle": last_cycle,
             "reason": "NO_NEW_CAUSALLY_COMPLETED_1H_BAR",
         }
     return {

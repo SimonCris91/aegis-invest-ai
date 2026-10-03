@@ -162,16 +162,44 @@ class EtoroOneHourAcquisitionCoordinator:
             else:
                 candidates.append(instrument)
 
-        # Keep the continuous Crypto lane first.  A global batch used to spend
-        # its whole budget on stale/closed instruments, so the 24/7 assets
-        # never reached a fresh completed bar before the provider backoff.
-        candidates.sort(
-            key=lambda item: (
-                item.asset_class is not AssetClass.CRYPTO,
-                *_progress_key(prior.get(item.broker_instrument_id), item),
-            )
+        # Reserve alternating slots within each class for a broker-verified
+        # open session and for discovery of the still-unverified universe.
+        # This refreshes executable European/US markets promptly without
+        # starving new instruments or allowing crypto to consume the batch.
+        by_class: dict[AssetClass, dict[bool, list[UniversalInstrument]]] = {}
+        for instrument in sorted(
+            candidates,
+            key=lambda item: _progress_key(prior.get(item.broker_instrument_id), item),
+        ):
+            verified_open = "session-state:OPEN_TRADABLE" in instrument.tags
+            by_class.setdefault(instrument.asset_class, {True: [], False: []})[
+                verified_open
+            ].append(instrument)
+        class_order = [
+            asset_class
+            for asset_class in (AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO)
+            if asset_class in by_class
+        ]
+        class_order.extend(
+            asset_class for asset_class in sorted(by_class, key=lambda value: value.value)
+            if asset_class not in class_order
         )
-        attempted = tuple(candidates[: self._batch_size])
+        selected: list[UniversalInstrument] = []
+        class_turns: dict[AssetClass, int] = Counter()
+        while len(selected) < self._batch_size and class_order:
+            next_order: list[AssetClass] = []
+            for asset_class in class_order:
+                lanes = by_class[asset_class]
+                prefer_verified = class_turns[asset_class] % 2 == 0
+                bucket = lanes[prefer_verified] or lanes[not prefer_verified]
+                selected.append(bucket.pop(0))
+                class_turns[asset_class] += 1
+                if len(selected) >= self._batch_size:
+                    break
+                if lanes[True] or lanes[False]:
+                    next_order.append(asset_class)
+            class_order = next_order
+        attempted = tuple(selected)
         if attempted:
             latest_before = {item.key: self._latest(item) for item in attempted}
             with ThreadPoolExecutor(max_workers=min(self._concurrency, len(attempted))) as pool:
@@ -206,7 +234,10 @@ class EtoroOneHourAcquisitionCoordinator:
                 )
                 results[fetched_instrument.broker_instrument_id] = result
 
-        for instrument in candidates[self._batch_size :]:
+        attempted_ids = {instrument.broker_instrument_id for instrument in attempted}
+        for instrument in candidates:
+            if instrument.broker_instrument_id in attempted_ids:
+                continue
             instrument_id = instrument.broker_instrument_id
             state = prior.get(instrument_id)
             outcome = MarketDataAcquisitionOutcome.NOT_ATTEMPTED

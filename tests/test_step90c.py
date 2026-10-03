@@ -89,7 +89,7 @@ def test_company_news_links_to_asset_sector_and_broad_etf_context_only_with_reas
     assert result.asset_contexts["AAPL"].aggregate_sentiment is NewsSentiment.POSITIVE
 
 
-def test_macro_news_links_to_etfs_gold_and_crypto_with_explicit_lower_confidence() -> None:
+def test_macro_news_stays_global_without_claiming_every_etf_and_crypto_is_affected() -> None:
     as_of = datetime(2026, 8, 28, 16, tzinfo=UTC)
     result = GlobalNewsIntelligenceEngine(
         NewsFeedProvider(
@@ -107,8 +107,8 @@ def test_macro_news_links_to_etfs_gold_and_crypto_with_explicit_lower_confidence
     linked = {link.symbol: link for link in event.companies_assets_affected}
 
     assert event.event_category is GlobalNewsEventCategory.CENTRAL_BANK
-    assert {"SPY", "QQQ", "GLD", "BTC", "ETH"}.issubset(linked)
-    assert linked["SPY"].confidence == Decimal("0.60")
+    assert linked == {}
+    assert all(context.unique_event_count == 0 for context in result.asset_contexts.values())
     assert result.global_risk_snapshot.monetary_policy_risk >= Decimal("0.80")
 
 
@@ -128,9 +128,10 @@ def test_crypto_regulation_links_crypto_only_when_asset_class_justifies_it() -> 
 
     linked = {link.symbol for link in result.normalized_events[0].companies_assets_affected}
 
-    assert {"BTC", "ETH"}.issubset(linked)
+    assert linked == {"BTC"}
     assert "AAPL" not in linked
     assert result.asset_contexts["BTC"].event_risk > Decimal("0")
+    assert result.asset_contexts["ETH"].unique_event_count == 0
 
 
 def test_conflicting_sentiment_is_reported_per_asset() -> None:
@@ -169,7 +170,7 @@ def test_stale_and_unavailable_news_are_explicit_not_fabricated_neutral() -> Non
     assert "not fabricated" in unavailable.asset_contexts["AAPL"].explanation
 
 
-def test_active_scanner_accepts_news_context_observationally_without_changing_scores() -> None:
+def test_active_scanner_scores_explicit_asset_news_with_bounded_weight() -> None:
     as_of = datetime(2026, 8, 28, tzinfo=UTC)
     instrument = _instrument("AAPL", AssetClass.EQUITY, "1001", as_of)
     bars = _bars(instrument, as_of=as_of)
@@ -204,9 +205,53 @@ def test_active_scanner_accepts_news_context_observationally_without_changing_sc
     assert with_news.candidates[0].news_sentiment == "POSITIVE"
     assert with_news.candidates[0].material_event_count == 1
     assert with_news.candidates[0].news_relevance > Decimal("0")
-    assert with_news.candidates[0].opportunity_score == without_news.candidates[0].opportunity_score
+    score_delta = (
+        with_news.candidates[0].opportunity_score
+        - without_news.candidates[0].opportunity_score
+    )
+    assert Decimal("0") < score_delta <= Decimal("0.60")
     assert with_news.candidates[0].confidence == without_news.candidates[0].confidence
     assert with_news.broker_write_calls == 0
+
+
+def test_scanner_decision_lanes_do_not_count_crypto_quote_pairs_as_separate_assets() -> None:
+    as_of = datetime(2026, 8, 28, 16, tzinfo=UTC)
+    instruments = (
+        _instrument(
+            "LTCAUD",
+            AssetClass.CRYPTO,
+            "4101",
+            as_of,
+            display_name="Litecoin / Australian Dollar",
+        ),
+        _instrument(
+            "LTCEUR",
+            AssetClass.CRYPTO,
+            "4102",
+            as_of,
+            display_name="Litecoin / Euro",
+        ),
+        _instrument(
+            "BTCUSD",
+            AssetClass.CRYPTO,
+            "4103",
+            as_of,
+            display_name="Bitcoin / US Dollar",
+        ),
+    )
+    portfolio = PortfolioSnapshot(as_of=as_of, currency=Currency.USD, cash=Decimal("2000"))
+    result = ActiveMarketScanner(minimum_bars=60).scan(
+        instruments=instruments,
+        bars_by_symbol={item.symbol: _bars(item, as_of=as_of) for item in instruments},
+        portfolio=portfolio,
+        as_of=as_of,
+        timeframe=TimeFrame.ONE_DAY,
+    )
+
+    assert len(result.candidates) == 3
+    assert sum(item.symbol.startswith("LTC") for item in result.top_opportunities) <= 1
+    assert sum(item.symbol.startswith("LTC") for item in result.watchlist) <= 1
+    assert any(item.symbol == "BTCUSD" for item in (*result.top_opportunities, *result.watchlist))
 
 
 def _raw(

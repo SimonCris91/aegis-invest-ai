@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#0b1014">
-    <title>Aegis Invest AI · Cruscotto operativo</title>
+    <title>Aegis Invest AI</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -12,15 +12,17 @@
       <header class="topbar">
         <div class="brand-lockup">
           <p class="eyebrow">AEGIS INVEST AI</p>
-          <h1>Cruscotto operativo</h1>
+          <h1>AEGIS Invest AI</h1>
         </div>
         <div class="header-status">
           <span class="scanner-indicator" id="header-scanner-status"><span class="status-dot"></span> Stato scanner in attesa</span>
           <span class="auto-refresh-status" id="auto-refresh-status">Aggiornamento automatico ogni 15s</span>
+          <button class="toggle-catalog-search" id="toggle-catalog-search" type="button" aria-expanded="false" aria-controls="catalog-search-root">Cerca</button>
           <button class="refresh-data" id="refresh-data" type="button">Aggiorna dati</button>
           <span class="read-only-mark" id="mode-header-mark">Sola lettura</span>
         </div>
       </header>
+      <div id="catalog-search-root" hidden></div>
       <div id="app" aria-live="polite">
         <section class="state-panel" data-state="loading">
           <span class="spinner" aria-hidden="true"></span>
