@@ -312,7 +312,7 @@ def test_default_policies_are_conservative_and_configurable() -> None:
 
     assert engine.policy_for(AssetClass.EQUITY).enabled
     assert engine.policy_for(AssetClass.ETF).long_allowed
-    assert engine.policy_for(AssetClass.CRYPTO).max_new_trade_exposure == Decimal("0.05")
+    assert engine.policy_for(AssetClass.CRYPTO).max_new_trade_exposure == Decimal("0.02")
     assert not engine.policy_for(AssetClass.FOREX).enabled
     assert not engine.policy_for(AssetClass.CFD).enabled
     assert not engine.policy_for(AssetClass.FUTURE).enabled

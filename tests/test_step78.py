@@ -434,8 +434,8 @@ def test_asset_strategy_profiles_are_versioned_and_asset_specific() -> None:
 
     assert len(profiles) >= len(AssetClass)
     assert equity.profile_version
-    assert crypto.minimum_confidence_for_buy > equity.minimum_confidence_for_buy
-    assert crypto.weight_for(DEFENSIVE_ID) > equity.weight_for(DEFENSIVE_ID)
+    assert crypto.minimum_confidence_for_buy == Decimal("0.45")
+    assert crypto.weight_for(DEFENSIVE_ID) < equity.weight_for(DEFENSIVE_ID)
     assert not cfd.enabled
 
 

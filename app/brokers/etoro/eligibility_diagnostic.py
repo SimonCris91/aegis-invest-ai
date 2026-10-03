@@ -13,7 +13,7 @@ from app.brokers.etoro.http import (
     UrllibTransport,
 )
 from app.brokers.etoro.live_candidates import current_catalog_candidates
-from app.brokers.etoro.mapping import map_demo_eligibility
+from app.brokers.etoro.mapping import EtoroEligibilityDenied, map_demo_eligibility
 from app.brokers.etoro.runtime import runtime_credentials
 from app.config.models import ApplicationConfig
 from app.domain.enums import OperatingMode
@@ -106,6 +106,24 @@ def inspect_payload(raw: object, instrument_id: int, symbol: str) -> dict[str, o
             mapping_exception_type=None,
             mapping_exception_message=None,
             exact_eligibility_rejection=list(_eligibility_blockers(eligibility)),
+        )
+    except EtoroEligibilityDenied:
+        rejection_reasons: list[str] = []
+        if item.get("allowOpenPosition") is False:
+            rejection_reasons.append("allowOpenPosition is false")
+        quantity_types = item.get("allowedOrderQuantityType")
+        if isinstance(quantity_types, list) and quantity_types:
+            normalized = {
+                str(value).strip().casefold().replace("_", "").replace("-", "")
+                for value in quantity_types
+            }
+            if not normalized & {"all", "amount", "cash", "byamount", "amountorder"}:
+                rejection_reasons.append("amount order quantity type is not supported")
+        result.update(
+            mapping_result="PASS",
+            mapping_exception_type=None,
+            mapping_exception_message=None,
+            exact_eligibility_rejection=rejection_reasons,
         )
     except (ValueError, RuntimeError) as exc:
         result.update(

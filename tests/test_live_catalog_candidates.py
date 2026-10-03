@@ -84,7 +84,7 @@ def test_catalog_is_universe_and_lookup_is_id_scoped(monkeypatch):
         ]
     )
     result = module.current_catalog_candidates(client, clock=lambda: NOW)
-    assert client.calls == [(1,), (2,), (3,), (4,), (6,)]
+    assert client.calls == [(2,), (1,), (3,), (4,), (6,)]
     assert [x.broker_instrument_id for x in result] == ["1", "6"]
     assert result[0].asset_class.value == "CRYPTO"
 
@@ -125,7 +125,14 @@ def test_catalog_offset_continues_ordered_batches_without_repeating(monkeypatch)
         selection_diagnostics=second_stats,
     )
 
-    expected_ids = [i for i in range(1, 131) if i != 5]
+    etf_ids = [i for i in range(1, 131) if i not in {1, 5}]
+    crypto_ids = [1]
+    expected_ids = []
+    for index in range(max(len(etf_ids), len(crypto_ids))):
+        if index < len(etf_ids):
+            expected_ids.append(etf_ids[index])
+        if index < len(crypto_ids):
+            expected_ids.append(crypto_ids[index])
     assert client.calls == [(i,) for i in expected_ids[:100]]
     assert first_stats["batch_catalog_count"] == 50
     assert first_stats["batch_end_offset"] == 50
@@ -198,7 +205,7 @@ def test_invalid_response_fails_closed(monkeypatch):
 
 
 def test_freshness_unchanged(monkeypatch):
-    setup_catalog(monkeypatch)
+    setup_catalog(monkeypatch, count=1)
     times = iter([NOW, NOW + timedelta(minutes=16)])
     with pytest.raises(ValueError, match="EXPIRED"):
         module.current_catalog_candidates(

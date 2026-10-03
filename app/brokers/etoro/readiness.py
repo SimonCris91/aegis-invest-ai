@@ -10,7 +10,7 @@ from app.agent.service import DeterministicAegisAgent
 from app.brokers.etoro.auth import EtoroCredentials
 from app.brokers.etoro.client import EtoroApiError, EtoroReadClient
 from app.brokers.etoro.http import DisciplinedHttpClient, UrllibTransport
-from app.brokers.etoro.mapping import asset_class_from_etoro_instrument_type
+from app.brokers.etoro.mapping import EtoroEligibilityDenied, asset_class_from_etoro_instrument_type
 from app.brokers.etoro.runtime import runtime_credentials, runtime_settings
 from app.brokers.identity import AccountIdentityGuard
 from app.brokers.market_validation import (
@@ -507,6 +507,22 @@ def build_etoro_readiness_report(
                 broker_identity_verified=identity_verified,
                 store=store,
             )
+    except EtoroEligibilityDenied:
+        add_check(
+            "demo_eligibility",
+            CHECK_FAIL,
+            "Demo eligibility does not allow opening this instrument",
+        )
+        _add_blocked_after_eligibility(add_check)
+        return _finalize_report(
+            now,
+            checks,
+            credentials_configured=True,
+            authentication_attempted=True,
+            authentication_successful=authentication_successful,
+            broker_identity_verified=identity_verified,
+            store=store,
+        )
     except EtoroApiError as exc:
         add_check(
             "demo_eligibility",

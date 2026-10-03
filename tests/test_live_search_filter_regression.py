@@ -16,7 +16,7 @@ from tests.test_live_catalog_candidates import row, setup_catalog
 
 
 def test_real_request_contract_restores_existing_open_interpretation(monkeypatch):
-    setup_catalog(monkeypatch)
+    setup_catalog(monkeypatch, count=1)
     now = datetime(2026, 9, 5, tzinfo=UTC)
     payload_row = row(1, isOpen=False, isExchangeOpen=True)
     old = map_instrument_resolution({"items": [payload_row]}, symbol="S1", as_of=now)

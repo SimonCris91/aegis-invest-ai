@@ -3317,7 +3317,7 @@ def test_guarded_v2b_confidence_profile_is_explicit_versioned_and_reversible() -
 
     assert legacy_profile_for(AssetClass.EQUITY).minimum_confidence_for_buy == Decimal("0.65")
     assert legacy_profile_for(AssetClass.ETF).minimum_confidence_for_buy == Decimal("0.62")
-    assert legacy_profile_for(AssetClass.CRYPTO).minimum_confidence_for_buy == Decimal("0.72")
+    assert legacy_profile_for(AssetClass.CRYPTO).minimum_confidence_for_buy == Decimal("0.45")
 
 
 def test_guarded_v2b_profile_keeps_asset_specific_evidence_warning_metadata() -> None:

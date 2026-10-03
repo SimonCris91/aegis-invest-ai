@@ -18,7 +18,7 @@ PAYLOAD = {
 
 @pytest.mark.parametrize("is_open", ["ABSENT", None, False])
 def test_live_btc_style_crypto_is_open(monkeypatch, is_open):
-    setup_catalog(monkeypatch)
+    setup_catalog(monkeypatch, count=1)
     payload = dict(PAYLOAD)
     if is_open != "ABSENT":
         payload["isOpen"] = is_open

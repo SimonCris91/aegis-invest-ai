@@ -199,21 +199,31 @@ def build_first_demo_preflight_report(
         add_check("demo_route_guard", CHECK_FAIL, "exact Demo route guard failed")
         return _finalize(now, checks, state, switch, store)
 
-    # Configuration enables the guarded Demo route; explicit human opt-in is
-    # the separate arming step.  Reject only when that confirmation is absent.
-    if not config.demo_smoke_test_opt_in:
+    # A read-only preflight must remain diagnostically useful while Demo
+    # execution is disabled.  Only reject here when the configuration is
+    # attempting to enable Demo execution without the complete guarded mode.
+    demo_execution_configuration_incomplete = config.etoro_demo_execution_enabled and (
+        config.broker_execution_mode.value != "DEMO_EXECUTION"
+        or not config.demo_smoke_test_opt_in
+    )
+    if demo_execution_configuration_incomplete:
         add_check(
             "demo_execution_disabled",
             CHECK_FAIL,
-            "Demo execution requires explicit human confirmation",
+            "Demo execution requires the guarded Demo mode and explicit human confirmation",
         )
         return _finalize(now, checks, state, switch, store)
     add_check(
         "demo_execution_disabled",
         CHECK_PASS,
-        "Demo execution has explicit human confirmation",
-        {"etoro_demo_execution_enabled": str(config.etoro_demo_execution_enabled).lower(),
-         "demo_smoke_test_opt_in": "true"},
+        "read-only preflight is allowed while Demo execution is disabled"
+        if not config.etoro_demo_execution_enabled
+        else "Demo execution has explicit human confirmation",
+        {
+            "etoro_demo_execution_enabled": str(config.etoro_demo_execution_enabled).lower(),
+            "demo_smoke_test_opt_in": str(config.demo_smoke_test_opt_in).lower(),
+            "broker_execution_mode": config.broker_execution_mode.value,
+        },
     )
 
     if store is not None and store.unresolved_demo_submissions():

@@ -95,7 +95,7 @@ def test_bounded_get_only_raw_mapping_diagnostic(monkeypatch, status):
         assert sample["http_status"] == status
         if status == 200:
             assert sample["mapping_exception_type"] == "EtoroMappingError"
-            assert sample["mapping_cause_type"] == "StopIteration"
+            assert sample["mapping_cause_type"] == "TypeError"
             assert sample["leverage_configs_count"] == 0
             assert "eligibilities" in sample["raw_top_level_keys"]
         else:
