@@ -327,6 +327,60 @@ def test_native_bootstrap_does_not_activate_short_one_hour_history(tmp_path: Pat
     assert report["broker_write_calls"] == 0
 
 
+def test_native_bootstrap_bounded_passes_advance_persisted_cursor(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "catalog.json"
+    progress_path = tmp_path / "bootstrap.json"
+    artifact_path = tmp_path / "active.json"
+    cache_path = tmp_path / "bars.sqlite3"
+    persist_etoro_instrument_catalog_snapshot(
+        {
+            "instrumentDisplayDatas": [
+                {"instrumentID": 123, "symbolFull": "ONE", "instrumentTypeID": 5},
+                {"instrumentID": 124, "symbolFull": "TWO", "instrumentTypeID": 5},
+                {"instrumentID": 125, "symbolFull": "THREE", "instrumentTypeID": 5},
+            ]
+        },
+        retrieved_at=NOW,
+        path=snapshot_path,
+    )
+    client = BootstrapClient()
+
+    first = build_etoro_universe_bootstrap_report(
+        ApplicationConfig(etoro_api_enabled=True),
+        client=cast(EtoroReadClient, client),
+        cache=HistoricalDataCache(cache_path),
+        snapshot_path=snapshot_path,
+        progress_path=progress_path,
+        artifact_path=artifact_path,
+        clock=lambda: NOW,
+        delay_seconds=0,
+        max_instruments_per_run=1,
+    )
+    second = build_etoro_universe_bootstrap_report(
+        ApplicationConfig(etoro_api_enabled=True),
+        client=cast(EtoroReadClient, client),
+        cache=HistoricalDataCache(cache_path),
+        snapshot_path=snapshot_path,
+        progress_path=progress_path,
+        artifact_path=artifact_path,
+        clock=lambda: NOW,
+        delay_seconds=0,
+        max_instruments_per_run=1,
+    )
+
+    assert first["processed_this_run"] == 1
+    assert first["cursor"] == 1
+    assert first["active_scanner_universe"] == 1
+    assert second["processed_this_run"] == 1
+    assert second["cursor"] == 2
+    assert second["active_scanner_universe"] == 2
+    assert len(client.calls) == 4
+    saved = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert saved["cursor"] == 2
+    assert len(saved["records"]) == 2
+    assert first["broker_write_calls"] == second["broker_write_calls"] == 0
+
+
 def test_bootstrap_stops_and_persists_cursor_on_rate_limit_then_resumes(
     tmp_path: Path,
 ) -> None:
