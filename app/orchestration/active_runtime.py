@@ -3076,11 +3076,45 @@ def build_etoro_demo_runtime_report(
     maintenance_every_polls = _configured_runtime_positive_int(
         values.get("AEGIS_UNIVERSE_MAINTENANCE_EVERY_POLLS"), default=1
     )
+    catalog_refresh_interval_seconds = _configured_runtime_positive_int(
+        values.get("AEGIS_ETORO_CATALOG_REFRESH_INTERVAL_SECONDS"), default=21600
+    )
 
     def maintain_universe() -> Mapping[str, object]:
-        from app.data.runtime import build_etoro_universe_bootstrap_report
+        from app.data.runtime import (
+            build_etoro_instrument_catalog_probe_report,
+            build_etoro_universe_bootstrap_report,
+            read_etoro_instrument_catalog_snapshot,
+        )
 
-        return build_etoro_universe_bootstrap_report(
+        maintenance_at = (clock or (lambda: datetime.now(UTC)))()
+        snapshot_before = read_etoro_instrument_catalog_snapshot()
+        catalog_refresh: Mapping[str, object] = {
+            "status": "CATALOG_REFRESH_NOT_DUE",
+            "broker_write_calls": 0,
+        }
+        if _catalog_refresh_due(
+            snapshot_before,
+            as_of=maintenance_at,
+            interval_seconds=catalog_refresh_interval_seconds,
+        ):
+            catalog_refresh = build_etoro_instrument_catalog_probe_report(
+                config,
+                values=values,
+                persist=True,
+                clock=lambda: maintenance_at,
+            )
+
+        snapshot_after = read_etoro_instrument_catalog_snapshot()
+        if snapshot_after is None:
+            return {
+                "status": "BLOCKED",
+                "blocker": "ETORO_CATALOG_SNAPSHOT_MISSING",
+                "catalog_refresh": dict(catalog_refresh),
+                "broker_write_calls": 0,
+            }
+
+        bootstrap = build_etoro_universe_bootstrap_report(
             config,
             values=values,
             clock=clock,
@@ -3088,6 +3122,15 @@ def build_etoro_demo_runtime_report(
             delay_seconds=0,
             max_instruments_per_run=maintenance_batch,
         )
+        return {
+            **bootstrap,
+            "catalog_refresh": dict(catalog_refresh),
+            "catalog_snapshot_changed": (
+                None
+                if snapshot_before is None
+                else snapshot_before.get("snapshot_id") != snapshot_after.get("snapshot_id")
+            ),
+        }
 
     runner = EtoroDemoContinuousRunner(
         run_once=lambda: build_etoro_demo_runtime_once_report(
@@ -3104,6 +3147,30 @@ def build_etoro_demo_runtime_report(
         maintenance_every_polls=maintenance_every_polls,
     )
     return runner.run(max_iterations=max_iterations)
+
+
+def _catalog_refresh_due(
+    snapshot: Mapping[str, object] | None,
+    *,
+    as_of: datetime,
+    interval_seconds: int,
+) -> bool:
+    if interval_seconds <= 0:
+        raise ValueError("catalog refresh interval must be positive")
+    if as_of.tzinfo is None:
+        raise ValueError("catalog refresh timestamp must be timezone-aware")
+    if snapshot is None:
+        return True
+    raw_retrieved_at = snapshot.get("retrieved_at")
+    if not isinstance(raw_retrieved_at, str) or not raw_retrieved_at.strip():
+        return True
+    try:
+        retrieved_at = datetime.fromisoformat(raw_retrieved_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if retrieved_at.tzinfo is None:
+        return True
+    return retrieved_at + timedelta(seconds=interval_seconds) <= as_of
 
 
 def _configured_runtime_positive_int(raw: str | None, *, default: int) -> int:

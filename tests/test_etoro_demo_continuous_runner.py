@@ -9,6 +9,7 @@ from app.brokers.models import BrokerIdentity, ExecutionState
 from app.orchestration.active_runtime import (
     ETORO_DEMO_RUNTIME_STATUS_KIND,
     EtoroDemoContinuousRunner,
+    _catalog_refresh_due,
     _reconcile_unresolved_demo_submissions,
     etoro_demo_runtime_status,
     read_etoro_demo_runtime_status,
@@ -129,6 +130,27 @@ def test_no_cycle_never_produces_demo_post() -> None:
     assert report["accepted_cycle_count"] == 0
     assert report["demo_broker_write_calls"] == writes == 0
     assert report["top_opportunity_count"] == 0
+
+
+def test_catalog_refresh_due_respects_snapshot_age() -> None:
+    now = datetime(2026, 10, 6, 18, 0, tzinfo=UTC)
+
+    assert _catalog_refresh_due(None, as_of=now, interval_seconds=21600)
+    assert not _catalog_refresh_due(
+        {"retrieved_at": (now - timedelta(hours=5)).isoformat()},
+        as_of=now,
+        interval_seconds=21600,
+    )
+    assert _catalog_refresh_due(
+        {"retrieved_at": (now - timedelta(hours=6)).isoformat()},
+        as_of=now,
+        interval_seconds=21600,
+    )
+    assert _catalog_refresh_due(
+        {"retrieved_at": "not-a-timestamp"},
+        as_of=now,
+        interval_seconds=21600,
+    )
 
 
 def test_runner_invokes_universe_maintenance_on_configured_poll_cadence() -> None:
