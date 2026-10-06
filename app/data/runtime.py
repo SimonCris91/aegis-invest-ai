@@ -548,6 +548,7 @@ def build_etoro_instrument_catalog_probe_report(
     client: EtoroReadClient | None = None,
     persist: bool = False,
     snapshot_path: Path = DEFAULT_ETORO_CATALOG_SNAPSHOT_PATH,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
     """Perform one sanitized, unfiltered eToro instrument-catalog GET."""
     credentials = runtime_credentials(values)
@@ -617,7 +618,9 @@ def build_etoro_instrument_catalog_probe_report(
     if persist:
         try:
             snapshot = persist_etoro_instrument_catalog_snapshot(
-                raw, retrieved_at=datetime.now(UTC), path=snapshot_path
+                raw,
+                retrieved_at=(clock or (lambda: datetime.now(UTC)))(),
+                path=snapshot_path,
             )
         except (OSError, ValueError) as exc:
             return {
