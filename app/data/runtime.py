@@ -1240,9 +1240,9 @@ def build_etoro_universe_bootstrap_report(
     status_counts = Counter(str(record["status"]) for record in progress_items)
     pending = max(0, len(items) - len(progress_items))
     retryable = (
-            status_counts.get("ERROR_RETRYABLE", 0)
-            + status_counts.get("INSUFFICIENT_HISTORY", 0)
-        )
+        status_counts.get("ERROR_RETRYABLE", 0)
+        + status_counts.get("INSUFFICIENT_HISTORY", 0)
+    )
     return {
         "status": (
             "ETORO_UNIVERSE_BOOTSTRAP_RATE_LIMITED"
