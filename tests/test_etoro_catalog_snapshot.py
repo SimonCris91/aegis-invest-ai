@@ -125,6 +125,7 @@ def test_probe_persists_complete_payload_without_truncation(tmp_path: Path) -> N
         client=cast(EtoroReadClient, CatalogClient(payload)),
         persist=True,
         snapshot_path=path,
+        clock=lambda: NOW,
     )
 
     snapshot = read_etoro_instrument_catalog_snapshot(path)
@@ -136,7 +137,7 @@ def test_probe_persists_complete_payload_without_truncation(tmp_path: Path) -> N
     assert isinstance(records, list)
     assert len(records) == 161
     assert snapshot["source_endpoint"] == "/api/v1/market-data/instruments"
-    assert snapshot["retrieved_at"]
+    assert snapshot["retrieved_at"] == NOW.isoformat()
     assert snapshot["snapshot_checksum_sha256"] == report["snapshot_checksum_sha256"]
 
 
