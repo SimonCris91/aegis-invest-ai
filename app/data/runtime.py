@@ -876,10 +876,13 @@ def build_etoro_universe_bootstrap_report(
     sleeper: Callable[[float], None] | None = None,
     batch_size: int = ETORO_UNIVERSE_BOOTSTRAP_BATCH_SIZE,
     delay_seconds: float = ETORO_UNIVERSE_BOOTSTRAP_DELAY_SECONDS,
+    max_instruments_per_run: int | None = None,
 ) -> dict[str, object]:
     """Bootstrap eToro-native scanner data without touching execution paths."""
     if batch_size <= 0 or delay_seconds < 0:
         raise ValueError("invalid bootstrap pacing")
+    if max_instruments_per_run is not None and max_instruments_per_run <= 0:
+        raise ValueError("max_instruments_per_run must be positive")
     now = (clock or (lambda: datetime.now(UTC)))()
     items = _validated_etoro_catalog_items(snapshot_path)
     snapshot = read_etoro_instrument_catalog_snapshot(snapshot_path)
@@ -889,6 +892,7 @@ def build_etoro_universe_bootstrap_report(
     retry_not_before: datetime | None = None
     rate_limit_attempts = 0
     cooldown_source: str | None = None
+    cursor = 0
     preserved_previous_statuses = 0
     bootstrap_rechecks = 0
     if progress_path.exists():
@@ -897,6 +901,7 @@ def build_etoro_universe_bootstrap_report(
         if isinstance(existing, dict):
             retry_not_before, rate_limit_attempts = persisted_cooldown(existing)
             cooldown_source = str(existing.get("cooldown_source") or "LEGACY_CHECKPOINT")
+            cursor = int(existing.get("cursor", 0)) % max(1, len(items))
             raw_records = existing.get("records", [])
             if isinstance(raw_records, list):
                 previous_records = {
@@ -996,6 +1001,8 @@ def build_etoro_universe_bootstrap_report(
             "rate_limit_attempts": rate_limit_attempts,
             "cooldown_source": cooldown_source,
             "requests_attempted": 0,
+            "processed_this_run": 0,
+            "cursor": cursor,
             "catalog_count": len(items),
             "checked": len(progress),
             "pending": pending,
@@ -1065,7 +1072,15 @@ def build_etoro_universe_bootstrap_report(
         "UNSUPPORTED",
         "UNSUPPORTED_INTERNAL",
     }
-    for index, item in enumerate(items):
+    processed_this_run = 0
+    ordered_positions = (
+        tuple((cursor + offset) % len(items) for offset in range(len(items)))
+        if items
+        else ()
+    )
+    next_cursor = cursor
+    for index, position in enumerate(ordered_positions):
+        item = items[position]
         instrument_id = _catalog_value(item, "instrumentID", "instrumentId")
         symbol = _catalog_value(item, "symbolFull")
         normalized_class = _catalog_asset_class(item)
@@ -1076,6 +1091,12 @@ def build_etoro_universe_bootstrap_report(
             # item.  Rebuilding and rewriting every prior record made the
             # cursor appear stuck for minutes before any new request ran.
             record = prior
+            next_cursor = (position + 1) % max(1, len(items))
+        elif (
+            max_instruments_per_run is not None
+            and processed_this_run >= max_instruments_per_run
+        ):
+            break
         elif item.get("isInternalInstrument") is True:
             record = {
                 "instrument_id": instrument_id,
@@ -1181,6 +1202,9 @@ def build_etoro_universe_bootstrap_report(
                 "updated_at": now.isoformat(),
             }
         progress[instrument_id] = record
+        if prior != record:
+            processed_this_run += 1
+        next_cursor = (position + 1) % max(1, len(items))
         if prior == record:
             if rate_limited:
                 break
@@ -1195,6 +1219,7 @@ def build_etoro_universe_bootstrap_report(
                 "source_endpoint": snapshot["source_endpoint"],
                 "required_timeframes": [TimeFrame.ONE_HOUR.value, TimeFrame.ONE_DAY.value],
                 "requested_bars_per_timeframe": ETORO_UNIVERSE_BOOTSTRAP_BARS,
+                "cursor": next_cursor,
                 "retry_not_before": retry_not_before.isoformat() if retry_not_before else None,
                 "rate_limit_attempts": rate_limit_attempts,
                 "cooldown_source": cooldown_source,
@@ -1224,6 +1249,7 @@ def build_etoro_universe_bootstrap_report(
             "source_endpoint": snapshot["source_endpoint"],
             "required_timeframes": [TimeFrame.ONE_HOUR.value, TimeFrame.ONE_DAY.value],
             "requested_bars_per_timeframe": ETORO_UNIVERSE_BOOTSTRAP_BARS,
+            "cursor": next_cursor,
             "retry_not_before": retry_not_before.isoformat() if retry_not_before else None,
             "rate_limit_attempts": rate_limit_attempts,
             "cooldown_source": cooldown_source,
@@ -1259,6 +1285,8 @@ def build_etoro_universe_bootstrap_report(
         "rate_limit_attempts": rate_limit_attempts,
         "cooldown_source": cooldown_source,
         "requests_attempted": requests_attempted,
+        "processed_this_run": processed_this_run,
+        "cursor": next_cursor,
         "catalog_count": len(items),
         "checked": len(progress_items),
         "pending": pending,
