@@ -2812,6 +2812,11 @@ def build_etoro_full_catalog_session_audit_report(
         "open_not_tradable": counts.get("OPEN_NOT_TRADABLE", 0),
         "closed": counts.get("CLOSED", 0),
         "unknown": counts.get("UNKNOWN", 0),
+        "active_universe_reference_count": len(active_ids),
+        "current_active_open_tradable": len(open_ids & active_ids),
+        "new_open_tradable_outside_active_universe": len(open_ids - active_ids),
+        # Backward-compatible aliases. Values refer to the current active
+        # universe, which is no longer assumed to contain exactly 633 rows.
         "current_633_open_tradable": len(open_ids & active_ids),
         "new_open_tradable_outside_current_633": len(open_ids - active_ids),
         "candidate_universe_read_only": sorted(open_ids),
