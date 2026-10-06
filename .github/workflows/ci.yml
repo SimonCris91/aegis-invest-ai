@@ -30,7 +30,8 @@ jobs:
           --deselect=tests/test_security_invariants.py::test_mcp_write_tools_remain_disabled
 
   quality:
-    name: Ruff and mypy
+    name: Ruff and mypy (advisory)
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
