@@ -812,9 +812,13 @@ class EtoroDemoContinuousRunner:
         error_backoff_seconds: float = 60.0,
         max_backoff_seconds: float = 300.0,
         status_store: SqliteRecordStore | None = None,
+        maintenance_once: Callable[[], Mapping[str, object]] | None = None,
+        maintenance_every_polls: int = 1,
     ) -> None:
         if poll_interval_seconds <= 0 or error_backoff_seconds <= 0 or max_backoff_seconds <= 0:
             raise ValueError("runner intervals must be positive")
+        if maintenance_every_polls <= 0:
+            raise ValueError("maintenance_every_polls must be positive")
         self._run_once = run_once
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleeper or sleep
@@ -822,6 +826,8 @@ class EtoroDemoContinuousRunner:
         self._error_backoff = error_backoff_seconds
         self._max_backoff = max_backoff_seconds
         self._status_store = status_store
+        self._maintenance_once = maintenance_once
+        self._maintenance_every_polls = maintenance_every_polls
 
     def run(
         self,
@@ -887,6 +893,8 @@ class EtoroDemoContinuousRunner:
         )
         last_result: Mapping[str, object] | None = None
         last_error: str | None = None
+        last_maintenance_result: Mapping[str, object] | None = None
+        last_maintenance_error: str | None = None
         heartbeat_stop = Event()
         heartbeat_thread: Thread | None = None
         if lease is not None and self._status_store is not None:
@@ -1004,6 +1012,17 @@ class EtoroDemoContinuousRunner:
                 demo_writes=demo_writes,
                 real_writes=real_writes,
             )
+            if (
+                self._maintenance_once is not None
+                and poll_count % self._maintenance_every_polls == 0
+            ):
+                try:
+                    last_maintenance_result = dict(self._maintenance_once())
+                    last_maintenance_error = None
+                except Exception as exc:
+                    # Universe maintenance is read-only support work and must
+                    # never terminate the primary scanner/runtime loop.
+                    last_maintenance_error = type(exc).__name__
             if not should_stop() and (max_iterations is None or poll_count < max_iterations):
                 try:
                     self._sleep(self._poll_interval)
@@ -1052,6 +1071,8 @@ class EtoroDemoContinuousRunner:
             "demo_broker_write_calls": demo_writes,
             "broker_write_calls_real": real_writes,
             "last_error": last_error,
+            "last_universe_maintenance": last_maintenance_result,
+            "last_universe_maintenance_error": last_maintenance_error,
         }
 
     def _persist_status(
@@ -3045,6 +3066,29 @@ def build_etoro_demo_runtime_report(
     error_backoff = _configured_runtime_seconds(
         values.get("AEGIS_ETORO_DEMO_ERROR_BACKOFF_SECONDS"), default=60.0
     )
+    maintenance_enabled = (
+        values.get("AEGIS_UNIVERSE_MAINTENANCE_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    maintenance_batch = _configured_runtime_positive_int(
+        values.get("AEGIS_UNIVERSE_MAINTENANCE_BATCH_SIZE"), default=16
+    )
+    maintenance_every_polls = _configured_runtime_positive_int(
+        values.get("AEGIS_UNIVERSE_MAINTENANCE_EVERY_POLLS"), default=1
+    )
+
+    def maintain_universe() -> Mapping[str, object]:
+        from app.data.runtime import build_etoro_universe_bootstrap_report
+
+        return build_etoro_universe_bootstrap_report(
+            config,
+            values=values,
+            clock=clock,
+            batch_size=maintenance_batch,
+            delay_seconds=0,
+            max_instruments_per_run=maintenance_batch,
+        )
+
     runner = EtoroDemoContinuousRunner(
         run_once=lambda: build_etoro_demo_runtime_once_report(
             config,
@@ -3056,8 +3100,20 @@ def build_etoro_demo_runtime_report(
         poll_interval_seconds=poll_interval,
         error_backoff_seconds=error_backoff,
         status_store=SqliteRecordStore(DEFAULT_ETORO_DEMO_RUNTIME_STORE_PATH),
+        maintenance_once=maintain_universe if maintenance_enabled else None,
+        maintenance_every_polls=maintenance_every_polls,
     )
     return runner.run(max_iterations=max_iterations)
+
+
+def _configured_runtime_positive_int(raw: str | None, *, default: int) -> int:
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError) as exc:
+        raise ValueError("runtime integer value must be positive") from exc
+    if value <= 0:
+        raise ValueError("runtime integer value must be positive")
+    return value
 
 
 def _configured_runtime_seconds(raw: str | None, *, default: float) -> float:
