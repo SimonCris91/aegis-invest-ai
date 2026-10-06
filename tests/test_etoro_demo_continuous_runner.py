@@ -131,6 +131,64 @@ def test_no_cycle_never_produces_demo_post() -> None:
     assert report["top_opportunity_count"] == 0
 
 
+def test_runner_invokes_universe_maintenance_on_configured_poll_cadence() -> None:
+    runtime_calls = 0
+    maintenance_calls = 0
+
+    def run_once() -> Mapping[str, object]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        return {
+            "status": "NO_CYCLE",
+            "cycle_id": None,
+            "demo_broker_write_calls": 0,
+            "broker_write_calls_real": 0,
+        }
+
+    def maintain_once() -> Mapping[str, object]:
+        nonlocal maintenance_calls
+        maintenance_calls += 1
+        return {
+            "status": "ETORO_UNIVERSE_BOOTSTRAP_INCOMPLETE",
+            "processed_this_run": 16,
+            "broker_write_calls": 0,
+        }
+
+    report = EtoroDemoContinuousRunner(
+        run_once=run_once,
+        maintenance_once=maintain_once,
+        maintenance_every_polls=2,
+        sleeper=lambda _: None,
+    ).run(max_iterations=3)
+
+    assert runtime_calls == 3
+    assert maintenance_calls == 1
+    assert report["last_universe_maintenance"]["processed_this_run"] == 16
+    assert report["last_universe_maintenance_error"] is None
+    assert report["broker_write_calls_real"] == 0
+
+
+def test_universe_maintenance_failure_does_not_stop_primary_runner() -> None:
+    runtime_calls = 0
+
+    def run_once() -> Mapping[str, object]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        return {"status": "NO_CYCLE", "cycle_id": None}
+
+    def maintain_once() -> Mapping[str, object]:
+        raise RuntimeError("synthetic universe maintenance failure")
+
+    report = EtoroDemoContinuousRunner(
+        run_once=run_once,
+        maintenance_once=maintain_once,
+        sleeper=lambda _: None,
+    ).run(max_iterations=2)
+
+    assert runtime_calls == 2
+    assert report["last_universe_maintenance_error"] == "RuntimeError"
+
+
 def test_runtime_exception_uses_bounded_backoff_then_recovers() -> None:
     calls = 0
     sleeps: list[float] = []
