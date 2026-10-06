@@ -978,7 +978,10 @@ def build_etoro_universe_bootstrap_report(
     if retry_not_before is not None and now < retry_not_before:
         status_counts = Counter(str(record["status"]) for record in progress.values())
         pending = max(0, len(items) - len(progress))
-        retryable = status_counts.get("ERROR_RETRYABLE", 0)
+        retryable = (
+            status_counts.get("ERROR_RETRYABLE", 0)
+            + status_counts.get("INSUFFICIENT_HISTORY", 0)
+        )
         active_count = sum(
             progress.get(_catalog_value(item, "instrumentID", "instrumentId"), {}).get("status")
             == "BOOTSTRAPPED"
@@ -1128,8 +1131,16 @@ def build_etoro_universe_bootstrap_report(
                         provider="etoro", bars=bars, fetched_at=now, mapping=reference
                     )
                 if error is None:
-                    status = "BOOTSTRAPPED"
-                    reason = "VALID_ETORO_NATIVE_ONE_HOUR_AND_ONE_DAY_DATA"
+                    one_hour_bars = timeframe_bars.get(TimeFrame.ONE_HOUR.value, 0)
+                    if one_hour_bars < ACTIVE_SCANNER_1H_MINIMUM_BARS:
+                        status = "INSUFFICIENT_HISTORY"
+                        reason = (
+                            "INSUFFICIENT_ONE_HOUR_HISTORY:"
+                            f"{one_hour_bars}/{ACTIVE_SCANNER_1H_MINIMUM_BARS}"
+                        )
+                    else:
+                        status = "BOOTSTRAPPED"
+                        reason = "VALID_ETORO_NATIVE_ONE_HOUR_AND_ONE_DAY_DATA"
                 elif error["category"] == "NO_DATA":
                     status = "NO_DATA"
                     reason = f"NO_DATA:{error['timeframe']}"
@@ -1228,7 +1239,10 @@ def build_etoro_universe_bootstrap_report(
     )
     status_counts = Counter(str(record["status"]) for record in progress_items)
     pending = max(0, len(items) - len(progress_items))
-    retryable = status_counts.get("ERROR_RETRYABLE", 0)
+    retryable = (
+            status_counts.get("ERROR_RETRYABLE", 0)
+            + status_counts.get("INSUFFICIENT_HISTORY", 0)
+        )
     return {
         "status": (
             "ETORO_UNIVERSE_BOOTSTRAP_RATE_LIMITED"
