@@ -30,25 +30,32 @@ class CatalogClient:
 
 
 class BootstrapClient:
-    def __init__(self) -> None:
+    def __init__(self, *, one_hour_count: int = 60, one_day_count: int = 1) -> None:
         self.calls: list[tuple[int, str, int]] = []
+        self.one_hour_count = one_hour_count
+        self.one_day_count = one_day_count
 
     def candle_history(
         self, *, instrument_id: int, direction: str, interval: str, candles_count: int
     ) -> object:
         self.calls.append((instrument_id, interval, candles_count))
+        count = self.one_hour_count if interval == "OneHour" else self.one_day_count
+        step = timedelta(hours=1) if interval == "OneHour" else timedelta(days=1)
         return {
             "candles": [
                 {
                     "candles": [
                         {
-                            "fromDate": "2026-08-30T10:00:00Z",
+                            "fromDate": (NOW - step * (count - index))
+                            .isoformat()
+                            .replace("+00:00", "Z"),
                             "open": "100",
                             "high": "101",
                             "low": "99",
                             "close": "100.5",
                             "volume": "10",
                         }
+                        for index in range(count)
                     ]
                 }
             ]
@@ -272,6 +279,52 @@ def test_native_bootstrap_is_resumable_and_builds_etoro_artifact(tmp_path: Path)
     )
     assert second["bootstrapped"] == 1
     assert len(client.calls) == 2
+
+
+def test_native_bootstrap_does_not_activate_short_one_hour_history(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "catalog.json"
+    progress_path = tmp_path / "bootstrap.json"
+    artifact_path = tmp_path / "active.json"
+    cache_path = tmp_path / "bars.sqlite3"
+    persist_etoro_instrument_catalog_snapshot(
+        {
+            "instrumentDisplayDatas": [
+                {
+                    "instrumentID": 123,
+                    "symbolFull": "SHORT",
+                    "instrumentDisplayName": "Short History Equity",
+                    "instrumentTypeID": 5,
+                }
+            ]
+        },
+        retrieved_at=NOW,
+        path=snapshot_path,
+    )
+    client = BootstrapClient(one_hour_count=59)
+    report = build_etoro_universe_bootstrap_report(
+        ApplicationConfig(etoro_api_enabled=True),
+        client=cast(EtoroReadClient, client),
+        cache=HistoricalDataCache(cache_path),
+        snapshot_path=snapshot_path,
+        progress_path=progress_path,
+        artifact_path=artifact_path,
+        clock=lambda: NOW,
+        batch_size=1,
+        delay_seconds=0,
+    )
+
+    assert report["status"] == "ETORO_UNIVERSE_BOOTSTRAP_INCOMPLETE"
+    assert report["bootstrapped"] == 0
+    assert report["active_scanner_universe"] == 0
+    assert report["retryable"] == 1
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress["records"][0]["status"] == "INSUFFICIENT_HISTORY"
+    assert progress["records"][0]["reason"] == "INSUFFICIENT_ONE_HOUR_HISTORY:59/60"
+    artifact = read_etoro_dynamic_universe_artifact(artifact_path)
+    assert artifact is not None
+    assert artifact["active_scanner_universe_count"] == 0
+    assert artifact["active_records"] == []
+    assert report["broker_write_calls"] == 0
 
 
 def test_bootstrap_stops_and_persists_cursor_on_rate_limit_then_resumes(

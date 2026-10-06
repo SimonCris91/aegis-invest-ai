@@ -182,6 +182,9 @@ def test_full_catalog_session_audit_is_bounded_and_excludes_internal_records(
     assert result["static_internal"] == 1
     assert result["not_yet_audited"] == 1
     assert result["open_tradable"] == 1
+    assert result["active_universe_reference_count"] == 0
+    assert result["current_active_open_tradable"] == 0
+    assert result["new_open_tradable_outside_active_universe"] == 1
     assert result["broker_write_calls"] == 0
     assert (tmp_path / "work" / "etoro-full-catalog-session-audit.json").exists()
 
